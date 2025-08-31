@@ -1,4 +1,4 @@
-// app.js — Yara WhatsApp auto-welcome + button handling (once per 24h)
+// app.js — Yara WhatsApp: welcome template (once/24h) + menu + buttons + location
 
 const express = require("express");
 const axios = require("axios");
@@ -8,15 +8,15 @@ app.use(express.json());
 
 // ===== ENV =====
 const PORT            = process.env.PORT || 3000;
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;        // used in webhook verify
-const WHATS_TOKEN     = process.env.WHATS_TOKEN;         // WhatsApp access token
+const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;        // webhook verify secret
+const WHATS_TOKEN     = process.env.WHATS_TOKEN;         // WA access token
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;     // e.g. 743488178852069
 
 if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
   console.error("❌ Missing WHATS_TOKEN or PHONE_NUMBER_ID environment variables.");
 }
 
-// ===== WhatsApp helpers =====
+// ===== Core WA helper =====
 async function waPost(payload) {
   const url = `https://graph.facebook.com/v23.0/${PHONE_NUMBER_ID}/messages`;
   return axios.post(url, payload, {
@@ -27,8 +27,9 @@ async function waPost(payload) {
   });
 }
 
-// 1) Send your approved template (edit name/lang if needed)
+// ===== Senders =====
 async function sendTemplate(to) {
+  // Edit to your approved template name & exact language/locale if needed
   await waPost({
     messaging_product: "whatsapp",
     to,
@@ -37,7 +38,6 @@ async function sendTemplate(to) {
   });
 }
 
-// 2) Send a plain text message
 async function sendText(to, body) {
   await waPost({
     messaging_product: "whatsapp",
@@ -47,9 +47,9 @@ async function sendText(to, body) {
   });
 }
 
-// 3) (Optional) Interactive list menu to follow the welcome
 async function sendMenu(to) {
-  const payload = {
+  // Interactive LIST with location option added
+  await waPost({
     messaging_product: "whatsapp",
     to,
     type: "interactive",
@@ -63,26 +63,42 @@ async function sendMenu(to) {
         sections: [{
           title: "القائمة",
           rows: [
-            { id: "show_products", title: "عرض التشكيلة", description: "خواتم • أطقم • سلاسل" },
-            { id: "show_pricing",  title: "الأسعار والعروض", description: "خصومات ومجموعات خاصة" },
-            { id: "talk_agent",    title: "تواصل مع ممثل",  description: "خدمة العملاء مباشرة" }
+            { id: "show_products",  title: "عرض التشكيلة", description: "خواتم • أطقم • سلاسل" },
+            { id: "show_pricing",   title: "الأسعار والعروض", description: "خصومات ومجموعات خاصة" },
+            { id: "show_location",  title: "الموقع",          description: "إرسال اللوكيشن" }, // NEW
+            { id: "talk_agent",     title: "تواصل مع ممثل",  description: "خدمة العملاء مباشرة" }
           ]
         }]
       }
     }
-  };
-  await waPost(payload);
+  });
 }
 
-// Replies based on template Quick Reply OR list/menu selections
+async function sendLocation(to) {
+  // Your shop pin (native WhatsApp location)
+  await waPost({
+    messaging_product: "whatsapp",
+    to,
+    type: "location",
+    location: {
+      latitude: 32.84854,
+      longitude: 35.20420,
+      name: "مجوهرات يارا",
+      address: "شارع ابن يدون، طمرة"
+    }
+  });
+}
+
+// ===== Choice router (buttons & list) =====
 async function handleChoice(from, idOrTitle) {
   const key = (idOrTitle || "").trim();
 
-  // Handle template quick-replies (match on button title)
   if (key === "عرض التشكيلة" || key === "show_products") {
     await sendText(from, "تفضل تشكيلة مجوهرات يارا: https://your-site/collection");
   } else if (key === "الأسعار والعروض" || key === "show_pricing") {
     await sendText(from, "الأسعار والعروض الحالية: https://your-site/pricing");
+  } else if (key === "الموقع" || key === "show_location") {
+    await sendLocation(from);
   } else if (key === "تواصل مع ممثل خدمة العملاء" || key === "talk_agent") {
     await sendText(from, "سيتم تحويلك لممثل خدمة العملاء قريباً. يمكنك أيضاً إرسال سؤالك هنا.");
   } else {
@@ -104,7 +120,7 @@ function shouldSendWelcome(waId) {
   return false;
 }
 
-// Clean old cache entries hourly
+// Clean old cache entries hourly (best-effort)
 setInterval(() => {
   const now = Date.now();
   for (const [waId, ts] of welcomeCache.entries()) {
@@ -147,15 +163,22 @@ app.post("/", async (req, res) => {
           const from = msg.from;
           if (!from) continue;
 
-          // A) User tapped a quick-reply button in your template
+          // 0) Free-text location keywords
+          const text = msg.text?.body?.trim();
+          if (text && /^(الموقع|لوكيشن|المكان|location|map)$/i.test(text)) {
+            await sendLocation(from);
+            continue;
+          }
+
+          // 1) Template Quick Reply buttons
           if (msg.type === "interactive" && msg.interactive?.type === "button_reply") {
             const { id, title } = msg.interactive.button_reply || {};
             console.log("🔘 Template button:", { id, title });
             await handleChoice(from, id || title);
-            continue; // do not send the welcome again
+            continue;
           }
 
-          // B) User selected from your interactive LIST menu
+          // 2) Interactive LIST selections
           if (msg.type === "interactive" && msg.interactive?.type === "list_reply") {
             const { id, title } = msg.interactive.list_reply || {};
             console.log("📋 List choice:", { id, title });
@@ -163,14 +186,14 @@ app.post("/", async (req, res) => {
             continue;
           }
 
-          // C) Any other inbound (e.g., plain text)
+          // 3) Any other inbound (e.g., plain text)
           if (shouldSendWelcome(from)) {
-            // First time in 24h: send template (welcome) then menu (optional)
+            // First time in 24h: send welcome template then menu (optional)
             await sendTemplate(from);
-            await sendMenu(from);                 // remove if you don't want menu
+            await sendMenu(from);
           } else {
-            // Already welcomed within TTL: just send menu or handle normally
-            await sendMenu(from);                 // or: await sendText(from, "كيف نقدر نساعدك؟");
+            // Already welcomed: just send menu or your default handling
+            await sendMenu(from);
           }
         }
       }
@@ -179,7 +202,7 @@ app.post("/", async (req, res) => {
     res.sendStatus(200);
   } catch (e) {
     console.error("❌ Webhook error:", e?.response?.data || e);
-    res.sendStatus(200); // Always ack to avoid retries
+    res.sendStatus(200); // always ack to avoid retries
   }
 });
 
