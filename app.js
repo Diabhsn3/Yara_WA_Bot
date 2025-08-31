@@ -15,7 +15,7 @@ async function sendTemplate(to) {
     messaging_product: "whatsapp",
     to,
     type: "template",
-    template: { name: "yara_greeting", language: { code: "ar" } } // <-- your template
+    template: { name: "greeting", language: { code: "ar" } } // <-- your template
   };
   await axios.post(url, payload, {
     headers: { Authorization: `Bearer ${WHATS_TOKEN}`, "Content-Type": "application/json" }
