@@ -1,90 +1,108 @@
-// app.js — Auto-welcome with a WhatsApp Template
-
 const express = require("express");
 const axios = require("axios");
 
 const app = express();
 app.use(express.json());
 
-// --- ENV (set these in Render → Environment) ---
-const PORT             = process.env.PORT || 3000;
-const VERIFY_TOKEN     = process.env.VERIFY_TOKEN;      // e.g. hasan-verify-123
-const WHATS_TOKEN      = process.env.WHATS_TOKEN;       // your WA access token
-const PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID;   // e.g. 743488178852069
+const PORT            = process.env.PORT || 3000;
+const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
+const WHATS_TOKEN     = process.env.WHATS_TOKEN;          // must be set in Render
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;      // e.g. 743488178852069
 
-// --- helper: send your approved template (change name/lang if needed) ---
-async function sendTemplate(to) {
+// ---------- helpers ----------
+async function waPost(payload) {
   const url = `https://graph.facebook.com/v23.0/${PHONE_NUMBER_ID}/messages`;
-  const payload = {
+  return axios.post(url, payload, {
+    headers: {
+      Authorization: `Bearer ${WHATS_TOKEN}`,
+      "Content-Type": "application/json"
+    }
+  });
+}
+
+async function sendTemplate(to) {
+  // your approved template name & language
+  await waPost({
     messaging_product: "whatsapp",
     to,
     type: "template",
-    template: { name: "greeting", language: { code: "ar" } } // <— your template
-  };
-  try {
-    const { data } = await axios.post(url, payload, {
-      headers: {
-        Authorization: `Bearer ${WHATS_TOKEN}`,
-        "Content-Type": "application/json"
-      }
-    });
-    console.log("✅ Template sent:", JSON.stringify(data));
-  } catch (err) {
-    console.error("❌ sendTemplate error:",
-      err.response?.data || err.message || err);
+    template: { name: "greeting", language: { code: "ar" } }
+  });
+}
+
+async function sendText(to, body) {
+  await waPost({
+    messaging_product: "whatsapp",
+    to,
+    type: "text",
+    text: { body }
+  });
+}
+
+// Example replies per button
+async function handleButtonChoice(from, titleOrId) {
+  // Normalize (trim/strip) just in case
+  const key = (titleOrId || "").trim();
+
+  if (key === "عرض التشكيلة") {
+    await sendText(from, "تفضل تشكيلة مجوهرات يارا: https://your-site/collection");
+  } else if (key === "الأسعار والعروض") {
+    await sendText(from, "الأسعار والعروض الحالية: https://your-site/pricing");
+  } else if (key === "تواصل مع ممثل خدمة العملاء") {
+    await sendText(from, "سيتواصل معك ممثل خدمة العملاء قريباً. بإمكانك أيضاً إرسال سؤالك هنا.");
+  } else {
+    // Fallback
+    await sendText(from, "شكراً لتواصلك معنا. كيف نقدر نساعدك؟");
   }
 }
 
-// --- GET /  (Webhook verification) ---
+// ---------- webhook verify ----------
 app.get("/", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("✅ WEBHOOK VERIFIED");
-    return res.status(200).send(challenge);
-  }
+  if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
-// --- POST / (Inbound messages) ---
+// ---------- webhook receive ----------
 app.post("/", async (req, res) => {
   try {
     const body = req.body;
-    console.log("\n📥 Inbound:", JSON.stringify(body, null, 2));
+    console.log("📥 Inbound:", JSON.stringify(body, null, 2));
 
-    // Only handle WhatsApp BA notifications
-    if (body.object !== "whatsapp_business_account") {
-      return res.sendStatus(200);
-    }
+    if (body.object !== "whatsapp_business_account") return res.sendStatus(200);
 
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const value = change.value || {};
 
-        // Ignore delivery/read status webhooks
+        // ignore delivery/read status callbacks
         if (value.statuses) continue;
 
-        const messages = value.messages || [];
-        for (const msg of messages) {
-          const from = msg.from; // customer's WA number (E.164 without '+')
+        const msgs = value.messages || [];
+        for (const msg of msgs) {
+          const from = msg.from;
           if (!from) continue;
 
-          // Auto send your welcome template
+          // 1) Handle quick-reply button clicks from your template
+          if (msg.type === "interactive" && msg.interactive?.type === "button_reply") {
+            const { id, title } = msg.interactive.button_reply || {};
+            console.log("🔘 Button clicked:", { id, title });
+            await handleButtonChoice(from, id || title);
+            continue;
+          }
+
+          // 2) For any other inbound (e.g., plain text), send welcome template
           await sendTemplate(from);
         }
       }
     }
-
-    return res.sendStatus(200);
   } catch (e) {
-    console.error("❌ Webhook handler error:", e.response?.data || e);
-    return res.sendStatus(200); // always ack to avoid retries
+    console.error("❌ Webhook error:", e?.response?.data || e);
   }
+  res.sendStatus(200);
 });
 
-// Health check
 app.get("/health", (_req, res) => res.send("OK"));
-
-app.listen(PORT, () => console.log(`\n🚀 Listening on ${PORT}\n`));
+app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
