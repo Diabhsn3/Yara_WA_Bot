@@ -1,3 +1,20 @@
+{
+  "name": "yara-whatsapp-webhook",
+  "version": "1.0.0",
+  "main": "app.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "engines": {
+    "node": ">=18 <=22"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "express": "^4.19.2"
+  }
+}
+
 // app.js
 // ----- Imports & setup
 const express = require("express");
