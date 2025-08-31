@@ -1,4 +1,3 @@
-// app.js
 const express = require("express");
 const axios = require("axios");
 
@@ -6,9 +5,9 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;         // e.g. hasan-verify-123
-const WHATS_TOKEN = process.env.WHATS_TOKEN;           // WA access token
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;   // digits from API Setup
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const WHATS_TOKEN = process.env.WHATS_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 async function sendTemplate(to) {
   const url = `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`;
@@ -16,7 +15,7 @@ async function sendTemplate(to) {
     messaging_product: "whatsapp",
     to,
     type: "template",
-    template: { name: "yara_greeting", language: { code: "ar" } }
+    template: { name: "yara_greeting", language: { code: "ar" } } // <-- your template
   };
   await axios.post(url, payload, {
     headers: { Authorization: `Bearer ${WHATS_TOKEN}`, "Content-Type": "application/json" }
@@ -32,26 +31,35 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// Handle inbound
+// Handle inbound messages
 app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
-    console.log("📥 Inbound:", JSON.stringify(body, null, 2));
-    if (body.object === "whatsapp_business_account") {
-      for (const entry of body.entry || []) {
-        for (const change of entry.changes || []) {
-          const msgs = change.value?.messages;
-          if (msgs && msgs.length) {
-            const from = msgs[0].from; // customer number
-            await sendTemplate(from);
-          }
+
+    // Ignore non-message events (e.g., delivery/read statuses)
+    if (body.object !== "whatsapp_business_account") return res.sendStatus(200);
+
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
+        const value = change.value || {};
+
+        // If we got message statuses only, skip
+        if (value.statuses) continue;
+
+        const msgs = value.messages || [];
+        for (const msg of msgs) {
+          const from = msg.from; // customer's WhatsApp number (E.164 without +)
+          // Send your template as auto-reply
+          await sendTemplate(from);
         }
       }
     }
+
+    res.sendStatus(200);
   } catch (e) {
     console.error("Webhook error:", e?.response?.data || e);
+    res.sendStatus(200);
   }
-  res.sendStatus(200);
 });
 
 app.get("/", (_req, res) => res.send("OK"));
