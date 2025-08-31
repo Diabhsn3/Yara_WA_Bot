@@ -9,7 +9,7 @@ app.use(express.json());
 // --- ENV (set these in Render → Environment) ---
 const PORT             = process.env.PORT || 3000;
 const VERIFY_TOKEN     = process.env.VERIFY_TOKEN;      // e.g. hasan-verify-123
-const WHATS_TOKEN      = EAANeda0KzzABPZAXOOpZBzEKfxXTiVtLpSn7QIr5QWXSHLdb7bZBbaPX4SxezqgMZBlBo4p6AkiBtvcyyD37b9pYRFg2dq69EZBLHrRLSKVQmlcr3rvao98FUkw9EZAzIPlfweZC5ES9jnOaJYuGf1YZBFIztRD60oDkNGauJJlVnnZB99TWDGEuCWAzq7HGLDiq9DZALfcvZAynDje7q8mSghgfdihe9GZAgH7DyS9aVfvNBeDhsgZDZD;       // your WA access token
+const WHATS_TOKEN      = process.env.WHATS_TOKEN;       // your WA access token
 const PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID;   // e.g. 743488178852069
 
 // --- helper: send your approved template (change name/lang if needed) ---
