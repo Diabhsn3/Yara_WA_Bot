@@ -1,37 +1,90 @@
-// Import Express.js
-const express = require('express');
+// app.js — Auto-welcome with a WhatsApp Template
 
-// Create an Express app
+const express = require("express");
+const axios = require("axios");
+
 const app = express();
-
-// Middleware to parse JSON bodies
 app.use(express.json());
 
-// Set port and verify_token
-const port = process.env.PORT || 3000;
-const verifyToken = process.env.VERIFY_TOKEN;
+// --- ENV (set these in Render → Environment) ---
+const PORT             = process.env.PORT || 3000;
+const VERIFY_TOKEN     = process.env.VERIFY_TOKEN;      // e.g. hasan-verify-123
+const WHATS_TOKEN      = process.env.WHATS_TOKEN;       // your WA access token
+const PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID;   // e.g. 743488178852069
 
-// Route for GET requests
-app.get('/', (req, res) => {
-  const { 'hub.mode': mode, 'hub.challenge': challenge, 'hub.verify_token': token } = req.query;
+// --- helper: send your approved template (change name/lang if needed) ---
+async function sendTemplate(to) {
+  const url = `https://graph.facebook.com/v23.0/${PHONE_NUMBER_ID}/messages`;
+  const payload = {
+    messaging_product: "whatsapp",
+    to,
+    type: "template",
+    template: { name: "greeting", language: { code: "ar" } } // <— your template
+  };
+  try {
+    const { data } = await axios.post(url, payload, {
+      headers: {
+        Authorization: `Bearer ${WHATS_TOKEN}`,
+        "Content-Type": "application/json"
+      }
+    });
+    console.log("✅ Template sent:", JSON.stringify(data));
+  } catch (err) {
+    console.error("❌ sendTemplate error:",
+      err.response?.data || err.message || err);
+  }
+}
 
-  if (mode === 'subscribe' && token === verifyToken) {
-    console.log('WEBHOOK VERIFIED');
-    res.status(200).send(challenge);
-  } else {
-    res.status(403).end();
+// --- GET /  (Webhook verification) ---
+app.get("/", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("✅ WEBHOOK VERIFIED");
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+});
+
+// --- POST / (Inbound messages) ---
+app.post("/", async (req, res) => {
+  try {
+    const body = req.body;
+    console.log("\n📥 Inbound:", JSON.stringify(body, null, 2));
+
+    // Only handle WhatsApp BA notifications
+    if (body.object !== "whatsapp_business_account") {
+      return res.sendStatus(200);
+    }
+
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
+        const value = change.value || {};
+
+        // Ignore delivery/read status webhooks
+        if (value.statuses) continue;
+
+        const messages = value.messages || [];
+        for (const msg of messages) {
+          const from = msg.from; // customer's WA number (E.164 without '+')
+          if (!from) continue;
+
+          // Auto send your welcome template
+          await sendTemplate(from);
+        }
+      }
+    }
+
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error("❌ Webhook handler error:", e.response?.data || e);
+    return res.sendStatus(200); // always ack to avoid retries
   }
 });
 
-// Route for POST requests
-app.post('/', (req, res) => {
-  const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  console.log(`\n\nWebhook received ${timestamp}\n`);
-  console.log(JSON.stringify(req.body, null, 2));
-  res.status(200).end();
-});
+// Health check
+app.get("/health", (_req, res) => res.send("OK"));
 
-// Start the server
-app.listen(port, () => {
-  console.log(`\nListening on port ${port}\n`);
-});
+app.listen(PORT, () => console.log(`\n🚀 Listening on ${PORT}\n`));
