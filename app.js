@@ -1,4 +1,5 @@
-// app.js — Yara WhatsApp: welcome (once/24h) + ordered menu + buttons + location + agent handoff + optional template header image
+// app.js — Yara WhatsApp: welcome (once/24h) ➜ menu (ordered)
+// + buttons + location + agent handoff + optional template header image
 
 const express = require("express");
 const axios = require("axios");
@@ -17,9 +18,9 @@ const TEMPLATE_LANG   = process.env.TEMPLATE_LANG || "ar";
 
 // Provide ONE (or none) if your template header expects IMAGE:
 const TEMPLATE_HEADER_IMAGE_URL =
-  process.env.TEMPLATE_HEADER_IMAGE_URL || ""; // e.g. public https://.../image.jpg
-const TEMPLATE_HEADER_MEDIA_ID   =
-  process.env.TEMPLATE_HEADER_MEDIA_ID || "";  // media id returned by /media
+  process.env.TEMPLATE_HEADER_IMAGE_URL || "";  // public URL (https://...)
+const TEMPLATE_HEADER_MEDIA_ID =
+  process.env.TEMPLATE_HEADER_MEDIA_ID || "";   // media id from /media
 
 // Delay to keep ordering: greeting → menu (ms)
 const WELCOME_MENU_DELAY_MS = Number(process.env.WELCOME_MENU_DELAY_MS || 900);
@@ -34,13 +35,12 @@ if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
 // ===== Utils =====
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Dedup inbound message IDs (avoid double processing when Meta retries)
+// Dedup inbound message IDs (avoid double processing on retries)
 const processed = new Set();
 function alreadyProcessed(id) {
   if (!id) return false;
   if (processed.has(id)) return true;
   processed.add(id);
-  // keep set from growing forever
   if (processed.size > 5000) {
     const it = processed.values();
     processed.delete(it.next().value);
@@ -63,7 +63,10 @@ async function waPost(payload) {
 // ===== Senders =====
 async function sendTemplate(to) {
   // Only attach a header if you actually provided one
-  const hasHeaderImage = Boolean(TEMPLATE_HEADER_MEDIA_ID || TEMPLATE_HEADER_IMAGE_URL);
+  const hasHeaderImage = Boolean(
+    (TEMPLATE_HEADER_MEDIA_ID && TEMPLATE_HEADER_MEDIA_ID.trim()) ||
+    (TEMPLATE_HEADER_IMAGE_URL && TEMPLATE_HEADER_IMAGE_URL.trim())
+  );
 
   const template = {
     name: TEMPLATE_NAME,
@@ -116,10 +119,10 @@ async function sendMenu(to) {
           {
             title: "القائمة",
             rows: [
-              { id: "show_products",  title: "عرض التشكيلة",    description: "خواتم • أطقم • سلاسل" },
-              { id: "show_pricing",   title: "الأسعار والعروض",  description: "خصومات ومجموعات خاصة" },
+              { id: "show_products",  title: "عرض التشكيلة",     description: "خواتم • أطقم • سلاسل" },
+              { id: "show_pricing",   title: "الأسعار والعروض",   description: "خصومات ومجموعات خاصة" },
               { id: "show_location",  title: "📍 موقعنا (اللوكيشن)", description: "استلم موقعنا كلوكيشن" },
-              { id: "talk_agent",     title: "📞 خدمة العملاء",   description: "تواصل مباشر مع ممثلنا" },
+              { id: "talk_agent",     title: "📞 خدمة العملاء",    description: "تواصل مباشر مع ممثلنا" },
             ],
           },
         ],
@@ -267,9 +270,9 @@ app.post("/", async (req, res) => {
             continue;
           }
 
-          // Any other inbound: welcome (once per 24h) then menu
+          // Any other inbound: welcome (once per 24h) then menu (with enforced order)
           if (shouldSendWelcome(from)) {
-            await sendTemplate(from);                 // send greeting first
+            await sendTemplate(from);                 // greeting first
             await sleep(WELCOME_MENU_DELAY_MS);       // small pause to keep order
             await sendMenu(from);                     // then the menu
           } else {
