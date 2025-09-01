@@ -1,5 +1,6 @@
-// app.js — Yara WhatsApp: ordered greeting ➜ single menu (no duplicates)
-// + menu/list, buttons, location, agent handoff, optional template header image
+// app.js — Yara WhatsApp: ordered greeting ➜ single menu
+// Menu/list, buttons, location, agent handoff, template header image
+// If user types free text instead of choosing, send a polite prompt + the menu
 
 const express = require("express");
 const axios = require("axios");
@@ -124,6 +125,15 @@ async function sendMenu(to) {
   });
 }
 
+// New: prompt + menu helper
+async function sendMenuWithPrompt(to) {
+  await sendText(
+    to,
+    "لفهم طلبك بسرعة، اختر من القائمة أدناه 👇 أو اكتب \"الموقع\" للحصول على اللوكيشن."
+  );
+  await sendMenu(to);
+}
+
 async function sendLocation(to) {
   // First: send location pin
   await waPost({
@@ -189,7 +199,7 @@ async function handleChoice(from, idOrTitle) {
   } else if (key === "تواصل مع ممثل خدمة العملاء" || key === "talk_agent" || key === "📞 خدمة العملاء") {
     await startAgentFlow(from);
   } else {
-    await sendText(from, "كيف نقدر نساعدك؟");
+    await sendMenuWithPrompt(from);
   }
 }
 
@@ -213,7 +223,6 @@ setInterval(() => {
   for (const [waId, ts] of welcomeCache.entries()) {
     if (now - ts > WELCOME_TTL_MS) welcomeCache.delete(waId);
   }
-  // periodically trim menuSentForTemplate to avoid unbounded growth
   if (menuSentForTemplate.size > 10000) menuSentForTemplate.clear();
 }, 60 * 60 * 1000);
 
@@ -238,7 +247,7 @@ app.post("/", async (req, res) => {
       for (const change of entry.changes || []) {
         const v = change.value || {};
 
-        // --- A) Status callbacks (we use them to order greeting ➜ menu) ---
+        // --- A) Status callbacks: keep order (greeting ➜ menu) ---
         if (Array.isArray(v.statuses) && v.statuses.length) {
           for (const st of v.statuses) {
             const waId   = st?.recipient_id; // customer wa_id
@@ -248,16 +257,14 @@ app.post("/", async (req, res) => {
             const pendingId = pendingMenuByUser.get(waId);
             if (!pendingId || pendingId !== msgId) continue;
 
-            // Trigger the menu only ONCE, on the first "sent"
             if (status === "sent" && !menuSentForTemplate.has(msgId)) {
-              // cooldown per user to avoid duplicates if we get bursts
               const last = lastMenuAt.get(waId) || 0;
               if (Date.now() - last >= MENU_COOLDOWN_MS) {
                 await sendMenu(waId);
                 lastMenuAt.set(waId, Date.now());
               }
-              menuSentForTemplate.add(msgId);   // remember we already sent
-              pendingMenuByUser.delete(waId);   // stop waiting
+              menuSentForTemplate.add(msgId);
+              pendingMenuByUser.delete(waId);
             }
           }
           continue; // handled statuses
@@ -267,24 +274,23 @@ app.post("/", async (req, res) => {
         for (const msg of v.messages || []) {
           const from = msg.from;
           const id   = msg.id;
-
           if (!from || alreadyProcessed(id)) continue;
 
-          // agent handoff capture
           const textBody = msg.text?.body?.trim();
 
+          // Agent handoff capture
           if (awaitingQuestion.get(from) && textBody) {
             await finishAgentFlow(from, textBody);
             continue;
           }
 
-          // location keywords
+          // Location keywords handled immediately
           if (textBody && /^(الموقع|لوكيشن|المكان|location|map)$/i.test(textBody)) {
             await sendLocation(from);
             continue;
           }
 
-          // interactive replies
+          // Interactive replies
           if (msg.type === "interactive") {
             if (msg.interactive?.type === "button_reply") {
               const { id, title } = msg.interactive.button_reply || {};
@@ -298,24 +304,34 @@ app.post("/", async (req, res) => {
             }
           }
 
-          // First message: send template and WAIT for its status to send menu
-          if (shouldSendWelcome(from)) {
-            const templateMsgId = await sendTemplate(from);
-            if (templateMsgId) {
-              pendingMenuByUser.set(from, templateMsgId);
+          // Non-interactive free text:
+          if (textBody) {
+            // If welcome not sent in last 24h, send greeting and wait for status to push menu
+            if (shouldSendWelcome(from)) {
+              const templateMsgId = await sendTemplate(from);
+              if (templateMsgId) {
+                pendingMenuByUser.set(from, templateMsgId);
+              } else {
+                await sleep(600);
+                await sendMenu(from);
+                lastMenuAt.set(from, Date.now());
+              }
             } else {
-              // Fallback if API didn't return an id
-              await sleep(600);
-              await sendMenu(from);
-              lastMenuAt.set(from, Date.now());
+              // Polite prompt + menu (cooldown)
+              const last = lastMenuAt.get(from) || 0;
+              if (Date.now() - last >= MENU_COOLDOWN_MS) {
+                await sendMenuWithPrompt(from);
+                lastMenuAt.set(from, Date.now());
+              }
             }
-          } else {
-            // Subsequent text: just show menu (with cooldown)
-            const last = lastMenuAt.get(from) || 0;
-            if (Date.now() - last >= MENU_COOLDOWN_MS) {
-              await sendMenu(from);
-              lastMenuAt.set(from, Date.now());
-            }
+            continue;
+          }
+
+          // Any other inbound without text: just show menu (respect cooldown)
+          const last = lastMenuAt.get(from) || 0;
+          if (Date.now() - last >= MENU_COOLDOWN_MS) {
+            await sendMenu(from);
+            lastMenuAt.set(from, Date.now());
           }
         }
       }
