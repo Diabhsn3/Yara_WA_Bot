@@ -125,6 +125,7 @@ async function sendMenu(to) {
 }
 
 async function sendLocation(to) {
+  // First: send location pin
   await waPost({
     messaging_product: "whatsapp",
     to,
@@ -133,9 +134,15 @@ async function sendLocation(to) {
       latitude: 32.84854,
       longitude: 35.20420,
       name: "مجوهرات يارا",
-      address: "شارع ابن زيدون، طمرة",
+      address: "طمرة، شارع ابن زيدون"
     },
   });
+
+  // Then: send business hours in a follow-up text
+  await sendText(
+    to,
+    `⏰ ساعات العمل:\n• السبت – الخميس: 12:00 ظهرًا – 21:00 مساءً\n• الجمعة: 15:00 ظهرًا – 21:00 مساءً`
+  );
 }
 
 // ===== Agent handoff via wa.me (prefills the agent’s box) =====
