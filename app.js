@@ -1,4 +1,4 @@
-// app.js — Yara WhatsApp: welcome (once/24h) + menu + buttons + location + agent handoff link
+// app.js — Yara WhatsApp: welcome (once/24h) + menu + buttons + location + agent handoff link + template header image
 
 const express = require("express");
 const axios = require("axios");
@@ -11,6 +11,20 @@ const PORT            = process.env.PORT || 3000;
 const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;        // webhook verify secret
 const WHATS_TOKEN     = process.env.WHATS_TOKEN;         // WA access token
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;     // e.g. 743488178852069
+
+// Template config (you can override from Render → Environment)
+const TEMPLATE_NAME = process.env.TEMPLATE_NAME || "greetings_2";
+const TEMPLATE_LANG = process.env.TEMPLATE_LANG || "ar";
+
+// If your template header expects IMAGE, provide ONE of these:
+// 1) Public URL (we use your Google Drive direct link by default)
+const TEMPLATE_HEADER_IMAGE_URL =
+  process.env.TEMPLATE_HEADER_IMAGE_URL ||
+  "https://drive.google.com/uc?export=download&id=10FOFqxeM0YO72n6SaOHGYfVIEU5vBbLw";
+
+// 2) OR media id (if you uploaded the image to WhatsApp and got an id)
+// If you set this, leave TEMPLATE_HEADER_IMAGE_URL empty.
+const TEMPLATE_HEADER_MEDIA_ID = process.env.TEMPLATE_HEADER_MEDIA_ID || "";
 
 if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
   console.error("❌ Missing WHATS_TOKEN or PHONE_NUMBER_ID environment variables.");
@@ -29,12 +43,36 @@ async function waPost(payload) {
 
 // ===== Senders =====
 async function sendTemplate(to) {
-  // Use your approved template + language
+  // Build template payload and include header image if provided
+  const template = {
+    name: TEMPLATE_NAME,
+    language: { code: TEMPLATE_LANG }
+  };
+
+  // If template has IMAGE header, we must include the header component
+  const components = [];
+
+  if (TEMPLATE_HEADER_MEDIA_ID) {
+    components.push({
+      type: "header",
+      parameters: [{ type: "image", image: { id: TEMPLATE_HEADER_MEDIA_ID } }]
+    });
+  } else if (TEMPLATE_HEADER_IMAGE_URL) {
+    components.push({
+      type: "header",
+      parameters: [{ type: "image", image: { link: TEMPLATE_HEADER_IMAGE_URL } }]
+    });
+  }
+
+  if (components.length) {
+    template.components = components;
+  }
+
   await waPost({
     messaging_product: "whatsapp",
     to,
     type: "template",
-    template: { name: "greetings_2", language: { code: "ar" } }
+    template
   });
 }
 
