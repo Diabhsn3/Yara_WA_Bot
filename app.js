@@ -1,6 +1,5 @@
 // app.js — Yara WhatsApp: ordered greeting ➜ single menu
-// Menu/list, buttons, location, agent handoff, template header image
-// If user types free text instead of choosing, send a polite prompt + the menu
+// + location, agent handoff, template header image, and CATALOG (Option B: product_list)
 
 const express = require("express");
 const axios = require("axios");
@@ -10,19 +9,24 @@ app.use(express.json());
 
 // ===== ENV =====
 const PORT            = process.env.PORT || 3000;
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;                 // webhook verify secret
-const WHATS_TOKEN     = process.env.WHATS_TOKEN;                  // WA access token
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;              // e.g. 743488178852069
+const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
+const WHATS_TOKEN     = process.env.WHATS_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 const TEMPLATE_NAME   = process.env.TEMPLATE_NAME || "greetings_2";
 const TEMPLATE_LANG   = process.env.TEMPLATE_LANG || "ar";
+const TEMPLATE_HEADER_IMAGE_URL = (process.env.TEMPLATE_HEADER_IMAGE_URL || "").trim();
+const TEMPLATE_HEADER_MEDIA_ID  = (process.env.TEMPLATE_HEADER_MEDIA_ID  || "").trim();
 
-const TEMPLATE_HEADER_IMAGE_URL =
-  (process.env.TEMPLATE_HEADER_IMAGE_URL || "").trim();           // public URL if header=image
-const TEMPLATE_HEADER_MEDIA_ID =
-  (process.env.TEMPLATE_HEADER_MEDIA_ID || "").trim();            // media id if uploaded
+const AGENT_E164 = "972525555251"; // agent number (no +)
 
-const AGENT_E164 = "972525555251"; // agent number (without +)
+// === Catalog (Option B) ===
+const CATALOG_ID = (process.env.CATALOG_ID || "").trim(); // required to send catalog
+// Comma-separated retailer IDs from your Google Sheet: e.g. "p001,p002,p003"
+const CATALOG_RETAILER_IDS = (process.env.CATALOG_RETAILER_IDS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 
 if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
   console.error("❌ Missing WHATS_TOKEN or PHONE_NUMBER_ID env vars.");
@@ -31,16 +35,13 @@ if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
 // ===== Utils =====
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Dedup inbound message IDs (avoid double processing on retries)
+// Deduplicate inbound message IDs (Meta may retry)
 const processed = new Set();
 function alreadyProcessed(id) {
   if (!id) return false;
   if (processed.has(id)) return true;
   processed.add(id);
-  if (processed.size > 5000) {
-    const it = processed.values();
-    processed.delete(it.next().value);
-  }
+  if (processed.size > 5000) processed.delete(processed.values().next().value);
   return false;
 }
 
@@ -58,23 +59,17 @@ async function waPost(payload) {
 
 // ===== Senders =====
 async function sendTemplate(to) {
-  const template = {
-    name: TEMPLATE_NAME,
-    language: { code: TEMPLATE_LANG },
-  };
-
+  const template = { name: TEMPLATE_NAME, language: { code: TEMPLATE_LANG } };
   const hasHeaderImage = Boolean(TEMPLATE_HEADER_MEDIA_ID || TEMPLATE_HEADER_IMAGE_URL);
   if (hasHeaderImage) {
-    template.components = [
-      {
-        type: "header",
-        parameters: [
-          TEMPLATE_HEADER_MEDIA_ID
-            ? { type: "image", image: { id: TEMPLATE_HEADER_MEDIA_ID } }
-            : { type: "image", image: { link: TEMPLATE_HEADER_IMAGE_URL } },
-        ],
-      },
-    ];
+    template.components = [{
+      type: "header",
+      parameters: [
+        TEMPLATE_HEADER_MEDIA_ID
+          ? { type: "image", image: { id: TEMPLATE_HEADER_MEDIA_ID } }
+          : { type: "image", image: { link: TEMPLATE_HEADER_IMAGE_URL } },
+      ],
+    }];
   }
 
   const { data } = await waPost({
@@ -84,17 +79,11 @@ async function sendTemplate(to) {
     template,
   });
 
-  // Return the template message id so we can wait for its status
-  return data?.messages?.[0]?.id;
+  return data?.messages?.[0]?.id; // used to order greeting -> menu
 }
 
 async function sendText(to, body) {
-  await waPost({
-    messaging_product: "whatsapp",
-    to,
-    type: "text",
-    text: { body },
-  });
+  await waPost({ messaging_product: "whatsapp", to, type: "text", text: { body } });
 }
 
 async function sendMenu(to) {
@@ -109,33 +98,27 @@ async function sendMenu(to) {
       footer: { text: "شكراً لاختيارك مجوهرات يارا" },
       action: {
         button: "عرض الخدمات",
-        sections: [
-          {
-            title: "القائمة",
-            rows: [
-              { id: "show_products",  title: "عرض التشكيلة",     description: "خواتم • أطقم • سلاسل" },
-              { id: "show_pricing",   title: "الأسعار والعروض",   description: "خصومات ومجموعات خاصة" },
-              { id: "show_location",  title: "📍 موقعنا (اللوكيشن)", description: "استلم موقعنا كلوكيشن" },
-              { id: "talk_agent",     title: "📞 خدمة العملاء",    description: "تواصل مباشر مع ممثلنا" },
-            ],
-          },
-        ],
+        sections: [{
+          title: "القائمة",
+          rows: [
+            { id: "show_products",  title: "عرض التشكيلة",     description: "خواتم • أطقم • سلاسل" },
+            { id: "show_pricing",   title: "الأسعار والعروض",   description: "خصومات ومجموعات خاصة" },
+            { id: "show_location",  title: "📍 موقعنا (اللوكيشن)", description: "استلم موقعنا كلوكيشن" },
+            { id: "show_catalog",   title: "📖 الكتالوج",        description: "تصفح منتجاتنا" }, // NEW
+            { id: "talk_agent",     title: "📞 خدمة العملاء",    description: "تواصل مباشر مع ممثلنا" },
+          ],
+        }],
       },
     },
   });
 }
 
-// New: prompt + menu helper
 async function sendMenuWithPrompt(to) {
-  await sendText(
-    to,
-    "لفهم طلبك بسرعة، اختر من القائمة أدناه 👇 أو اكتب \"الموقع\" للحصول على اللوكيشن."
-  );
+  await sendText(to, "لفهم طلبك بسرعة، اختر من القائمة أدناه 👇 أو اكتب \"الموقع\" للحصول على اللوكيشن.");
   await sendMenu(to);
 }
 
 async function sendLocation(to) {
-  // First: send location pin
   await waPost({
     messaging_product: "whatsapp",
     to,
@@ -144,58 +127,74 @@ async function sendLocation(to) {
       latitude: 32.84854,
       longitude: 35.20420,
       name: "مجوهرات يارا",
-      address: "طمرة، شارع ابن زيدون"
+      address: "طمرة، شارع ابن زيدون",
     },
   });
-
-  // Then: send business hours in a follow-up text
-  await sendText(
-    to,
-    `⏰ ساعات العمل:\n• السبت – الخميس: 12:00 ظهرًا – 21:00 مساءً\n• الجمعة: 15:00 ظهرًا – 21:00 مساءً`
-  );
+  await sendText(to, `⏰ ساعات العمل:\n• السبت – الخميس: 12:00 ظهرًا – 21:00 مساءً\n• الجمعة: 15:00 ظهرًا – 21:00 مساءً`);
 }
 
-// ===== Agent handoff via wa.me (prefills the agent’s box) =====
+// ====== Catalog senders (Option B) ======
+async function sendCatalogList(to) {
+  if (!CATALOG_ID || CATALOG_RETAILER_IDS.length === 0) {
+    await sendText(to, "الكتالوج غير مهيأ بعد. الرجاء المحاولة لاحقًا.");
+    return;
+  }
+
+  // Build sections with up to 30 products total (API limit)
+  const items = CATALOG_RETAILER_IDS.slice(0, 30).map(id => ({ product_retailer_id: id }));
+  const sections = [{ title: "تشكيلة مختارة", product_items: items }];
+
+  await waPost({
+    messaging_product: "whatsapp",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "product_list",
+      header: { type: "text", text: "🛍️ كتالوج مجوهرات يارا" },
+      body:   { text: "اختر من منتجاتنا أدناه:" },
+      footer: { text: "تسوق ممتع!" },
+      action: {
+        catalog_id: CATALOG_ID,
+        sections,
+      },
+    },
+  });
+}
+
+// ===== Agent handoff (prefilled link) =====
 function buildAgentLink(question, waId) {
   const local = waId?.startsWith("972") ? "0" + waId.slice(3) : waId;
   const msg = `لقد وصلتك رسالة من "${local}" والرسالة هي:\n${question}`;
-  const encoded = encodeURIComponent(msg);
-  return `https://wa.me/${AGENT_E164}?text=${encoded}`;
+  return `https://wa.me/${AGENT_E164}?text=${encodeURIComponent(msg)}`;
 }
 
-const awaitingQuestion   = new Map(); // wa_id -> true
-const pendingMenuByUser  = new Map(); // wa_id -> templateMessageId waiting for status
-const menuSentForTemplate = new Set(); // templateMessageId that already triggered a menu
-const lastMenuAt         = new Map(); // wa_id -> timestamp (prevent bursts)
-const MENU_COOLDOWN_MS   = 3000;      // 3s safety window
+const awaitingQuestion     = new Map(); // wa_id -> true
+const pendingMenuByUser    = new Map(); // wa_id -> templateMessageId (waiting for status)
+const menuSentForTemplate  = new Set(); // template message ids that already triggered menu
+const lastMenuAt           = new Map(); // wa_id -> timestamp
+const MENU_COOLDOWN_MS     = 3000;
 
 async function startAgentFlow(from) {
   awaitingQuestion.set(from, true);
-  await sendText(
-    from,
-    "لخدمتِك بشكل أسرع، من فضلك اكتب باختصار سؤالك أو ما تريد الاستفسار عنه، وسنوفّر لك رابط محادثة مباشرة مع ممثل الخدمة."
-  );
+  await sendText(from, "لخدمتِك بشكل أسرع، اكتب باختصار سؤالك وسنرسل لك رابط محادثة مباشرة مع ممثل الخدمة.");
 }
 
 async function finishAgentFlow(from, userText) {
   awaitingQuestion.delete(from);
-  const link = buildAgentLink(userText, from);
-  await sendText(
-    from,
-    `شكرًا لك! اضغط على الرابط لبدء محادثة مباشرة مع ممثل الخدمة (سيظهر سؤالك مهيّأً للإرسال):\n${link}`
-  );
+  await sendText(from, `شكرًا لك! تواصل مباشرة مع ممثل الخدمة عبر الرابط:\n${buildAgentLink(userText, from)}`);
 }
 
 // ===== Choice router (buttons & list) =====
 async function handleChoice(from, idOrTitle) {
   const key = (idOrTitle || "").trim();
-
   if (key === "عرض التشكيلة" || key === "show_products") {
     await sendText(from, "تفضّل تشكيلة مجوهرات يارا: https://your-site/collection");
   } else if (key === "الأسعار والعروض" || key === "show_pricing") {
     await sendText(from, "الأسعار والعروض الحالية: https://your-site/pricing");
   } else if (key === "الموقع" || key === "show_location") {
     await sendLocation(from);
+  } else if (key === "📖 الكتالوج" || key === "show_catalog") {
+    await sendCatalogList(from); // <—— Option B
   } else if (key === "تواصل مع ممثل خدمة العملاء" || key === "talk_agent" || key === "📞 خدمة العملاء") {
     await startAgentFlow(from);
   } else {
@@ -203,10 +202,9 @@ async function handleChoice(from, idOrTitle) {
   }
 }
 
-// ===== Welcome throttle: once per user per 24h =====
-const WELCOME_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-const welcomeCache = new Map(); // wa_id -> lastSentTimestamp
-
+// ===== Welcome throttle (once / 24h) =====
+const WELCOME_TTL_MS = 24 * 60 * 60 * 1000;
+const welcomeCache = new Map();
 function shouldSendWelcome(waId) {
   const now = Date.now();
   const last = welcomeCache.get(waId);
@@ -217,16 +215,14 @@ function shouldSendWelcome(waId) {
   return false;
 }
 
-// Clean old cache entries hourly
+// Housekeeping
 setInterval(() => {
   const now = Date.now();
-  for (const [waId, ts] of welcomeCache.entries()) {
-    if (now - ts > WELCOME_TTL_MS) welcomeCache.delete(waId);
-  }
+  for (const [k, ts] of welcomeCache.entries()) if (now - ts > WELCOME_TTL_MS) welcomeCache.delete(k);
   if (menuSentForTemplate.size > 10000) menuSentForTemplate.clear();
 }, 60 * 60 * 1000);
 
-// ===== Webhook verify (GET /) =====
+// ===== Webhook verify =====
 app.get("/", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -235,28 +231,25 @@ app.get("/", (req, res) => {
   return res.sendStatus(403);
 });
 
-// ===== Webhook receive (POST /) =====
+// ===== Webhook receive =====
 app.post("/", async (req, res) => {
   try {
     const body = req.body;
     console.log("📥 Inbound:", JSON.stringify(body, null, 2));
-
     if (body.object !== "whatsapp_business_account") return res.sendStatus(200);
 
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const v = change.value || {};
 
-        // --- A) Status callbacks: keep order (greeting ➜ menu) ---
+        // A) Status callbacks — order greeting -> menu
         if (Array.isArray(v.statuses) && v.statuses.length) {
           for (const st of v.statuses) {
-            const waId   = st?.recipient_id; // customer wa_id
-            const msgId  = st?.id;           // message id whose status changed
-            const status = st?.status;       // sent | delivered | read | failed
-
+            const waId   = st?.recipient_id;
+            const msgId  = st?.id;
+            const status = st?.status; // sent | delivered | read | failed
             const pendingId = pendingMenuByUser.get(waId);
             if (!pendingId || pendingId !== msgId) continue;
-
             if (status === "sent" && !menuSentForTemplate.has(msgId)) {
               const last = lastMenuAt.get(waId) || 0;
               if (Date.now() - last >= MENU_COOLDOWN_MS) {
@@ -267,10 +260,10 @@ app.post("/", async (req, res) => {
               pendingMenuByUser.delete(waId);
             }
           }
-          continue; // handled statuses
+          continue;
         }
 
-        // --- B) Inbound messages from the user ---
+        // B) Inbound user messages
         for (const msg of v.messages || []) {
           const from = msg.from;
           const id   = msg.id;
@@ -284,7 +277,7 @@ app.post("/", async (req, res) => {
             continue;
           }
 
-          // Location keywords handled immediately
+          // Location keywords
           if (textBody && /^(الموقع|لوكيشن|المكان|location|map)$/i.test(textBody)) {
             await sendLocation(from);
             continue;
@@ -304,9 +297,8 @@ app.post("/", async (req, res) => {
             }
           }
 
-          // Non-interactive free text:
+          // Non-interactive free text
           if (textBody) {
-            // If welcome not sent in last 24h, send greeting and wait for status to push menu
             if (shouldSendWelcome(from)) {
               const templateMsgId = await sendTemplate(from);
               if (templateMsgId) {
@@ -317,7 +309,6 @@ app.post("/", async (req, res) => {
                 lastMenuAt.set(from, Date.now());
               }
             } else {
-              // Polite prompt + menu (cooldown)
               const last = lastMenuAt.get(from) || 0;
               if (Date.now() - last >= MENU_COOLDOWN_MS) {
                 await sendMenuWithPrompt(from);
@@ -327,7 +318,7 @@ app.post("/", async (req, res) => {
             continue;
           }
 
-          // Any other inbound without text: just show menu (respect cooldown)
+          // Anything else: send menu (cooldown)
           const last = lastMenuAt.get(from) || 0;
           if (Date.now() - last >= MENU_COOLDOWN_MS) {
             await sendMenu(from);
@@ -346,5 +337,4 @@ app.post("/", async (req, res) => {
 
 // Health
 app.get("/health", (_req, res) => res.send("OK"));
-
 app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
