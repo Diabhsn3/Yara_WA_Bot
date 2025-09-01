@@ -55,9 +55,9 @@ async function sendMenu(to) {
     type: "interactive",
     interactive: {
       type: "list",
-      header: { type: "text", text: "مجوهرات يارا ✨" },
-      body:   { text: "اختر الخدمة المطلوبة:" },
-      footer: { text: "شكراً لاختيارك يارا" },
+      header: { type: "text", text: "💎 تفضّل باختيار ما يناسبك 💎" },
+      body:   { text: "نقدّم لك هذه الخيارات لتسهيل تواصلك معنا:" },
+      footer: { text: "شكراً لاختيارك مجوهرات يارا" },
       action: {
         button: "عرض الخدمات",
         sections: [{
@@ -65,8 +65,8 @@ async function sendMenu(to) {
           rows: [
             { id: "show_products",  title: "عرض التشكيلة", description: "خواتم • أطقم • سلاسل" },
             { id: "show_pricing",   title: "الأسعار والعروض", description: "خصومات ومجموعات خاصة" },
-            { id: "show_location",  title: "الموقع",          description: "إرسال اللوكيشن" }, // NEW
-            { id: "talk_agent",     title: "تواصل مع ممثل",  description: "خدمة العملاء مباشرة" }
+            { id: "show_location",  title: "📍 موقعنا (اللوكيشن)",          description: "استلم رابط الموقع على الخريطة" }, // NEW
+            { id: "talk_agent",     title: "📞 خدمة العملاء",  description: "تواصل مباشر مع ممثلنا" }
           ]
         }]
       }
@@ -84,7 +84,7 @@ async function sendLocation(to) {
       latitude: 32.84854,
       longitude: 35.20420,
       name: "مجوهرات يارا",
-      address: "شارع ابن يدون، طمرة"
+      address: "شارع ابن زيدون، طمرة"
     }
   });
 }
