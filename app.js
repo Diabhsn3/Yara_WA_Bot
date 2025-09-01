@@ -1,4 +1,4 @@
-// app.js — Yara WhatsApp: ordered greeting ➜ menu using status callback
+// app.js — Yara WhatsApp: ordered greeting ➜ single menu (no duplicates)
 // + menu/list, buttons, location, agent handoff, optional template header image
 
 const express = require("express");
@@ -16,14 +16,12 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;              // e.g. 743488
 const TEMPLATE_NAME   = process.env.TEMPLATE_NAME || "greetings_2";
 const TEMPLATE_LANG   = process.env.TEMPLATE_LANG || "ar";
 
-// Provide ONE (or none) if your template header expects IMAGE:
 const TEMPLATE_HEADER_IMAGE_URL =
-  (process.env.TEMPLATE_HEADER_IMAGE_URL || "").trim();           // public URL (https://...)
+  (process.env.TEMPLATE_HEADER_IMAGE_URL || "").trim();           // public URL if header=image
 const TEMPLATE_HEADER_MEDIA_ID =
-  (process.env.TEMPLATE_HEADER_MEDIA_ID || "").trim();            // media id from /media
+  (process.env.TEMPLATE_HEADER_MEDIA_ID || "").trim();            // media id if uploaded
 
-// Agent number (E.164 without '+')
-const AGENT_E164 = "972525555251";
+const AGENT_E164 = "972525555251"; // agent number (without +)
 
 if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
   console.error("❌ Missing WHATS_TOKEN or PHONE_NUMBER_ID env vars.");
@@ -85,9 +83,8 @@ async function sendTemplate(to) {
     template,
   });
 
-  // Return the message id so we can wait for its status
-  const messageId = data?.messages?.[0]?.id;
-  return messageId;
+  // Return the template message id so we can wait for its status
+  return data?.messages?.[0]?.id;
 }
 
 async function sendText(to, body) {
@@ -136,10 +133,7 @@ async function sendLocation(to) {
       latitude: 32.84854,
       longitude: 35.20420,
       name: "مجوهرات يارا",
-      address: "طمرة، شارع ابن زيدون
-⏰ ساعات العمل:
-	•	السبت – الخميس: 12:00 ظهرًا – 21:00 مساءً
-	•	الجمعة: 15:00 ظهرًا – 21:00 مساء",
+      address: "شارع ابن زيدون، طمرة",
     },
   });
 }
@@ -152,8 +146,11 @@ function buildAgentLink(question, waId) {
   return `https://wa.me/${AGENT_E164}?text=${encoded}`;
 }
 
-const awaitingQuestion = new Map();         // wa_id -> true
-const pendingMenuByUser = new Map();        // wa_id -> templateMessageId we wait for
+const awaitingQuestion   = new Map(); // wa_id -> true
+const pendingMenuByUser  = new Map(); // wa_id -> templateMessageId waiting for status
+const menuSentForTemplate = new Set(); // templateMessageId that already triggered a menu
+const lastMenuAt         = new Map(); // wa_id -> timestamp (prevent bursts)
+const MENU_COOLDOWN_MS   = 3000;      // 3s safety window
 
 async function startAgentFlow(from) {
   awaitingQuestion.set(from, true);
@@ -209,6 +206,8 @@ setInterval(() => {
   for (const [waId, ts] of welcomeCache.entries()) {
     if (now - ts > WELCOME_TTL_MS) welcomeCache.delete(waId);
   }
+  // periodically trim menuSentForTemplate to avoid unbounded growth
+  if (menuSentForTemplate.size > 10000) menuSentForTemplate.clear();
 }, 60 * 60 * 1000);
 
 // ===== Webhook verify (GET /) =====
@@ -232,71 +231,84 @@ app.post("/", async (req, res) => {
       for (const change of entry.changes || []) {
         const v = change.value || {};
 
-        // --- A) Handle message status callbacks (ordering control) ---
+        // --- A) Status callbacks (we use them to order greeting ➜ menu) ---
         if (Array.isArray(v.statuses) && v.statuses.length) {
           for (const st of v.statuses) {
-            const waId = st?.recipient_id;          // sender (customer) wa_id
-            const msgId = st?.id;                   // message id whose status changed
-            const status = st?.status;              // sent, delivered, read, failed
+            const waId   = st?.recipient_id; // customer wa_id
+            const msgId  = st?.id;           // message id whose status changed
+            const status = st?.status;       // sent | delivered | read | failed
 
             const pendingId = pendingMenuByUser.get(waId);
-            if (pendingId && pendingId === msgId && (status === "sent" || status === "delivered")) {
-              // small safety pause, then send the menu and clear
-              await sleep(250);
-              await sendMenu(waId);
-              pendingMenuByUser.delete(waId);
+            if (!pendingId || pendingId !== msgId) continue;
+
+            // Trigger the menu only ONCE, on the first "sent"
+            if (status === "sent" && !menuSentForTemplate.has(msgId)) {
+              // cooldown per user to avoid duplicates if we get bursts
+              const last = lastMenuAt.get(waId) || 0;
+              if (Date.now() - last >= MENU_COOLDOWN_MS) {
+                await sendMenu(waId);
+                lastMenuAt.set(waId, Date.now());
+              }
+              menuSentForTemplate.add(msgId);   // remember we already sent
+              pendingMenuByUser.delete(waId);   // stop waiting
             }
           }
-          continue; // we handled statuses
+          continue; // handled statuses
         }
 
-        // --- B) Handle inbound messages (from user) ---
+        // --- B) Inbound messages from the user ---
         for (const msg of v.messages || []) {
           const from = msg.from;
           const id   = msg.id;
 
           if (!from || alreadyProcessed(id)) continue;
 
-          // If waiting for agent question and user sent text
+          // agent handoff capture
           const textBody = msg.text?.body?.trim();
+
           if (awaitingQuestion.get(from) && textBody) {
             await finishAgentFlow(from, textBody);
             continue;
           }
 
-          // free-text location keywords
+          // location keywords
           if (textBody && /^(الموقع|لوكيشن|المكان|location|map)$/i.test(textBody)) {
             await sendLocation(from);
             continue;
           }
 
-          // interactive: button
-          if (msg.type === "interactive" && msg.interactive?.type === "button_reply") {
-            const { id, title } = msg.interactive.button_reply || {};
-            await handleChoice(from, id || title);
-            continue;
+          // interactive replies
+          if (msg.type === "interactive") {
+            if (msg.interactive?.type === "button_reply") {
+              const { id, title } = msg.interactive.button_reply || {};
+              await handleChoice(from, id || title);
+              continue;
+            }
+            if (msg.interactive?.type === "list_reply") {
+              const { id, title } = msg.interactive.list_reply || {};
+              await handleChoice(from, id || title);
+              continue;
+            }
           }
 
-          // interactive: list reply
-          if (msg.type === "interactive" && msg.interactive?.type === "list_reply") {
-            const { id, title } = msg.interactive.list_reply || {};
-            await handleChoice(from, id || title);
-            continue;
-          }
-
-          // Any other inbound: welcome (once per 24h)
+          // First message: send template and WAIT for its status to send menu
           if (shouldSendWelcome(from)) {
             const templateMsgId = await sendTemplate(from);
             if (templateMsgId) {
-              // Wait for its status before sending the menu (to preserve order)
               pendingMenuByUser.set(from, templateMsgId);
             } else {
-              // Fallback: if no id returned, send menu after a short delay
+              // Fallback if API didn't return an id
               await sleep(600);
               await sendMenu(from);
+              lastMenuAt.set(from, Date.now());
             }
           } else {
-            await sendMenu(from);  // subsequent messages: just show the menu
+            // Subsequent text: just show menu (with cooldown)
+            const last = lastMenuAt.get(from) || 0;
+            if (Date.now() - last >= MENU_COOLDOWN_MS) {
+              await sendMenu(from);
+              lastMenuAt.set(from, Date.now());
+            }
           }
         }
       }
@@ -305,11 +317,11 @@ app.post("/", async (req, res) => {
     res.sendStatus(200);
   } catch (err) {
     console.error("❌ Webhook error:", err?.response?.data || err);
-    res.sendStatus(200); // always ack to avoid retries
+    res.sendStatus(200);
   }
 });
 
-// Health check
+// Health
 app.get("/health", (_req, res) => res.send("OK"));
 
 app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
