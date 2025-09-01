@@ -34,7 +34,7 @@ async function sendTemplate(to) {
     messaging_product: "whatsapp",
     to,
     type: "template",
-    template: { name: "greeting", language: { code: "ar" } }
+    template: { name: "greetings_2", language: { code: "ar" } }
   });
 }
 
