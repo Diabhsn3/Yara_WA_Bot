@@ -1,5 +1,5 @@
-// app.js — Yara WhatsApp: welcome (once/24h) ➜ menu (ordered)
-// + buttons + location + agent handoff + optional template header image
+// app.js — Yara WhatsApp: ordered greeting ➜ menu using status callback
+// + menu/list, buttons, location, agent handoff, optional template header image
 
 const express = require("express");
 const axios = require("axios");
@@ -9,21 +9,18 @@ app.use(express.json());
 
 // ===== ENV =====
 const PORT            = process.env.PORT || 3000;
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;                // webhook verify secret
-const WHATS_TOKEN     = process.env.WHATS_TOKEN;                 // WA access token
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;             // e.g. 743488178852069
+const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;                 // webhook verify secret
+const WHATS_TOKEN     = process.env.WHATS_TOKEN;                  // WA access token
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;              // e.g. 743488178852069
 
 const TEMPLATE_NAME   = process.env.TEMPLATE_NAME || "greetings_2";
 const TEMPLATE_LANG   = process.env.TEMPLATE_LANG || "ar";
 
 // Provide ONE (or none) if your template header expects IMAGE:
 const TEMPLATE_HEADER_IMAGE_URL =
-  process.env.TEMPLATE_HEADER_IMAGE_URL || "";  // public URL (https://...)
+  (process.env.TEMPLATE_HEADER_IMAGE_URL || "").trim();           // public URL (https://...)
 const TEMPLATE_HEADER_MEDIA_ID =
-  process.env.TEMPLATE_HEADER_MEDIA_ID || "";   // media id from /media
-
-// Delay to keep ordering: greeting → menu (ms)
-const WELCOME_MENU_DELAY_MS = Number(process.env.WELCOME_MENU_DELAY_MS || 900);
+  (process.env.TEMPLATE_HEADER_MEDIA_ID || "").trim();            // media id from /media
 
 // Agent number (E.164 without '+')
 const AGENT_E164 = "972525555251";
@@ -62,17 +59,12 @@ async function waPost(payload) {
 
 // ===== Senders =====
 async function sendTemplate(to) {
-  // Only attach a header if you actually provided one
-  const hasHeaderImage = Boolean(
-    (TEMPLATE_HEADER_MEDIA_ID && TEMPLATE_HEADER_MEDIA_ID.trim()) ||
-    (TEMPLATE_HEADER_IMAGE_URL && TEMPLATE_HEADER_IMAGE_URL.trim())
-  );
-
   const template = {
     name: TEMPLATE_NAME,
     language: { code: TEMPLATE_LANG },
   };
 
+  const hasHeaderImage = Boolean(TEMPLATE_HEADER_MEDIA_ID || TEMPLATE_HEADER_IMAGE_URL);
   if (hasHeaderImage) {
     template.components = [
       {
@@ -86,12 +78,16 @@ async function sendTemplate(to) {
     ];
   }
 
-  await waPost({
+  const { data } = await waPost({
     messaging_product: "whatsapp",
     to,
     type: "template",
     template,
   });
+
+  // Return the message id so we can wait for its status
+  const messageId = data?.messages?.[0]?.id;
+  return messageId;
 }
 
 async function sendText(to, body) {
@@ -147,15 +143,14 @@ async function sendLocation(to) {
 
 // ===== Agent handoff via wa.me (prefills the agent’s box) =====
 function buildAgentLink(question, waId) {
-  // Convert E.164 “972xxxxxxxxx” -> local “0xxxxxxxxx”
   const local = waId?.startsWith("972") ? "0" + waId.slice(3) : waId;
   const msg = `لقد وصلتك رسالة من "${local}" والرسالة هي:\n${question}`;
   const encoded = encodeURIComponent(msg);
   return `https://wa.me/${AGENT_E164}?text=${encoded}`;
 }
 
-// Track users who picked “talk to agent” and we’re waiting for their question
-const awaitingQuestion = new Map(); // wa_id -> true
+const awaitingQuestion = new Map();         // wa_id -> true
+const pendingMenuByUser = new Map();        // wa_id -> templateMessageId we wait for
 
 async function startAgentFlow(from) {
   awaitingQuestion.set(from, true);
@@ -234,9 +229,25 @@ app.post("/", async (req, res) => {
       for (const change of entry.changes || []) {
         const v = change.value || {};
 
-        // ignore delivery/read
-        if (v.statuses) continue;
+        // --- A) Handle message status callbacks (ordering control) ---
+        if (Array.isArray(v.statuses) && v.statuses.length) {
+          for (const st of v.statuses) {
+            const waId = st?.recipient_id;          // sender (customer) wa_id
+            const msgId = st?.id;                   // message id whose status changed
+            const status = st?.status;              // sent, delivered, read, failed
 
+            const pendingId = pendingMenuByUser.get(waId);
+            if (pendingId && pendingId === msgId && (status === "sent" || status === "delivered")) {
+              // small safety pause, then send the menu and clear
+              await sleep(250);
+              await sendMenu(waId);
+              pendingMenuByUser.delete(waId);
+            }
+          }
+          continue; // we handled statuses
+        }
+
+        // --- B) Handle inbound messages (from user) ---
         for (const msg of v.messages || []) {
           const from = msg.from;
           const id   = msg.id;
@@ -270,13 +281,19 @@ app.post("/", async (req, res) => {
             continue;
           }
 
-          // Any other inbound: welcome (once per 24h) then menu (with enforced order)
+          // Any other inbound: welcome (once per 24h)
           if (shouldSendWelcome(from)) {
-            await sendTemplate(from);                 // greeting first
-            await sleep(WELCOME_MENU_DELAY_MS);       // small pause to keep order
-            await sendMenu(from);                     // then the menu
+            const templateMsgId = await sendTemplate(from);
+            if (templateMsgId) {
+              // Wait for its status before sending the menu (to preserve order)
+              pendingMenuByUser.set(from, templateMsgId);
+            } else {
+              // Fallback: if no id returned, send menu after a short delay
+              await sleep(600);
+              await sendMenu(from);
+            }
           } else {
-            await sendMenu(from);                     // subsequent messages: menu only
+            await sendMenu(from);  // subsequent messages: just show the menu
           }
         }
       }
