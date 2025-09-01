@@ -129,8 +129,12 @@ async function sendLocation(to) {
 // ===== Agent handoff via wa.me link =====
 const AGENT_E164 = "972525555251"; // agent number (without +)
 function buildAgentLink(question, waId) {
-  const msg = `مرحبا، لدي سؤال من ${waId}:\n${question}`;
+  // remove the country code "972" and prefix with "0"
+  const localNumber = "0" + waId.slice(3);
+
+  const msg = `لقد وصلتك رسالة من "${localNumber}" والرساله هي:-\n${question}`;
   const encoded = encodeURIComponent(msg);
+
   return `https://wa.me/${AGENT_E164}?text=${encoded}`;
 }
 
@@ -150,7 +154,7 @@ async function finishAgentFlow(from, userText) {
   const link = buildAgentLink(userText, from);
   await sendText(
     from,
-    `شكرًا لك! اضغط على الرابط لبدء محادثة مباشرة مع ممثل الخدمة، وسيظهر سؤالك مُسبقًا:\n${link}`
+    `شكرًا لك! اضغط على الرابط لبدء محادثة مباشرة مع ممثل الخدمةا:\n${link}`
   );
 }
 
