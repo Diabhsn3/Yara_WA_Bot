@@ -1,4 +1,4 @@
-// app.js — Yara WhatsApp: welcome template (once/24h) + menu + buttons + location
+// app.js — Yara WhatsApp: welcome (once/24h) + menu + buttons + location + agent handoff link
 
 const express = require("express");
 const axios = require("axios");
@@ -29,7 +29,7 @@ async function waPost(payload) {
 
 // ===== Senders =====
 async function sendTemplate(to) {
-  // Edit to your approved template name & exact language/locale if needed
+  // Use your approved template + language
   await waPost({
     messaging_product: "whatsapp",
     to,
@@ -48,7 +48,7 @@ async function sendText(to, body) {
 }
 
 async function sendMenu(to) {
-  // Interactive LIST with location option added
+  // Interactive LIST including location and agent options
   await waPost({
     messaging_product: "whatsapp",
     to,
@@ -63,9 +63,9 @@ async function sendMenu(to) {
         sections: [{
           title: "القائمة",
           rows: [
-            { id: "show_products",  title: "عرض التشكيلة", description: "خواتم • أطقم • سلاسل" },
+            { id: "show_products",  title: "عرض التشكيلة",   description: "خواتم • أطقم • سلاسل" },
             { id: "show_pricing",   title: "الأسعار والعروض", description: "خصومات ومجموعات خاصة" },
-            { id: "show_location",  title: "📍 موقعنا (اللوكيشن)",          description: "استلم رابط الموقع على الخريطة" }, // NEW
+            { id: "show_location",  title: "📍 موقعنا (اللوكيشن)", description: "استلم موقعنا كلوكيشن" },
             { id: "talk_agent",     title: "📞 خدمة العملاء",  description: "تواصل مباشر مع ممثلنا" }
           ]
         }]
@@ -75,7 +75,6 @@ async function sendMenu(to) {
 }
 
 async function sendLocation(to) {
-  // Your shop pin (native WhatsApp location)
   await waPost({
     messaging_product: "whatsapp",
     to,
@@ -89,6 +88,34 @@ async function sendLocation(to) {
   });
 }
 
+// ===== Agent handoff via wa.me link =====
+const AGENT_E164 = "972525555251"; // agent number (without +)
+function buildAgentLink(question, waId) {
+  const msg = `مرحبا، لدي سؤال من ${waId}:\n${question}`;
+  const encoded = encodeURIComponent(msg);
+  return `https://wa.me/${AGENT_E164}?text=${encoded}`;
+}
+
+// Track users who selected “talk to agent” and we’re waiting for their question
+const awaitingQuestion = new Map(); // wa_id -> true
+
+async function startAgentFlow(from) {
+  awaitingQuestion.set(from, true);
+  await sendText(
+    from,
+    "لخدمتِك بشكل أسرع، من فضلك اكتب باختصار سؤالك أو ما تريد الاستفسار عنه، وسنحوّلك لممثل خدمة العملاء."
+  );
+}
+
+async function finishAgentFlow(from, userText) {
+  awaitingQuestion.delete(from);
+  const link = buildAgentLink(userText, from);
+  await sendText(
+    from,
+    `شكرًا لك! اضغط على الرابط لبدء محادثة مباشرة مع ممثل الخدمة، وسيظهر سؤالك مُسبقًا:\n${link}`
+  );
+}
+
 // ===== Choice router (buttons & list) =====
 async function handleChoice(from, idOrTitle) {
   const key = (idOrTitle || "").trim();
@@ -99,8 +126,8 @@ async function handleChoice(from, idOrTitle) {
     await sendText(from, "الأسعار والعروض الحالية: https://your-site/pricing");
   } else if (key === "الموقع" || key === "show_location") {
     await sendLocation(from);
-  } else if (key === "تواصل مع ممثل خدمة العملاء" || key === "talk_agent") {
-    await sendText(from, "سيتم تحويلك لممثل خدمة العملاء قريباً. يمكنك أيضاً إرسال سؤالك هنا.");
+  } else if (key === "تواصل مع ممثل خدمة العملاء" || key === "talk_agent" || key === "📞 خدمة العملاء") {
+    await startAgentFlow(from);
   } else {
     await sendText(from, "كيف نقدر نساعدك؟");
   }
@@ -163,10 +190,16 @@ app.post("/", async (req, res) => {
           const from = msg.from;
           if (!from) continue;
 
-          // 0) Free-text location keywords
-          const text = msg.text?.body?.trim();
-          if (text && /^(الموقع|لوكيشن|المكان|location|map)$/i.test(text)) {
+          // 0) Keyword location by free text
+          const textBody = msg.text?.body?.trim();
+          if (textBody && /^(الموقع|لوكيشن|المكان|location|map)$/i.test(textBody)) {
             await sendLocation(from);
+            continue;
+          }
+
+          // If we are waiting for the user's question for agent handoff:
+          if (awaitingQuestion.get(from) && textBody) {
+            await finishAgentFlow(from, textBody);
             continue;
           }
 
@@ -188,11 +221,9 @@ app.post("/", async (req, res) => {
 
           // 3) Any other inbound (e.g., plain text)
           if (shouldSendWelcome(from)) {
-            // First time in 24h: send welcome template then menu (optional)
             await sendTemplate(from);
             await sendMenu(from);
           } else {
-            // Already welcomed: just send menu or your default handling
             await sendMenu(from);
           }
         }
