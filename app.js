@@ -1,6 +1,4 @@
-// app.js — Yara WhatsApp
-// Reliable order: send greeting template, wait for status, then send menu.
-// Includes: header image, location sharing, agent handoff link, 24h throttle.
+// app.js — Yara WhatsApp: welcome (once/24h) + ordered menu + buttons + location + agent handoff + optional template header image
 
 const express = require("express");
 const axios = require("axios");
@@ -10,30 +8,47 @@ app.use(express.json());
 
 // ===== ENV =====
 const PORT            = process.env.PORT || 3000;
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
-const WHATS_TOKEN     = process.env.WHATS_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID; // e.g. 743488178852069
+const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;                // webhook verify secret
+const WHATS_TOKEN     = process.env.WHATS_TOKEN;                 // WA access token
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;             // e.g. 743488178852069
 
-// Template config
-const TEMPLATE_NAME = process.env.TEMPLATE_NAME || "greetings_2";
-const TEMPLATE_LANG = process.env.TEMPLATE_LANG || "ar";
+const TEMPLATE_NAME   = process.env.TEMPLATE_NAME || "greetings_2";
+const TEMPLATE_LANG   = process.env.TEMPLATE_LANG || "ar";
 
-// If your template header expects IMAGE, pass ONE of:
-//   TEMPLATE_HEADER_MEDIA_ID  (if uploaded to WA media)
-//   TEMPLATE_HEADER_IMAGE_URL (public URL)
-const TEMPLATE_HEADER_MEDIA_ID = process.env.TEMPLATE_HEADER_MEDIA_ID || "";
+// Provide ONE (or none) if your template header expects IMAGE:
 const TEMPLATE_HEADER_IMAGE_URL =
-  process.env.TEMPLATE_HEADER_IMAGE_URL ||
-  "https://drive.google.com/uc?export=download&id=10FOFqxeM0YO72n6SaOHGYfVIEU5vBbLw";
+  process.env.TEMPLATE_HEADER_IMAGE_URL || ""; // e.g. public https://.../image.jpg
+const TEMPLATE_HEADER_MEDIA_ID   =
+  process.env.TEMPLATE_HEADER_MEDIA_ID || "";  // media id returned by /media
 
-// Agent handoff
-const AGENT_E164 = "972525555251"; // agent number without '+'
+// Delay to keep ordering: greeting → menu (ms)
+const WELCOME_MENU_DELAY_MS = Number(process.env.WELCOME_MENU_DELAY_MS || 900);
+
+// Agent number (E.164 without '+')
+const AGENT_E164 = "972525555251";
 
 if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
   console.error("❌ Missing WHATS_TOKEN or PHONE_NUMBER_ID env vars.");
 }
 
-// ===== HTTP helper to WA =====
+// ===== Utils =====
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Dedup inbound message IDs (avoid double processing when Meta retries)
+const processed = new Set();
+function alreadyProcessed(id) {
+  if (!id) return false;
+  if (processed.has(id)) return true;
+  processed.add(id);
+  // keep set from growing forever
+  if (processed.size > 5000) {
+    const it = processed.values();
+    processed.delete(it.next().value);
+  }
+  return false;
+}
+
+// ===== WhatsApp core helper =====
 async function waPost(payload) {
   const url = `https://graph.facebook.com/v23.0/${PHONE_NUMBER_ID}/messages`;
   return axios.post(url, payload, {
@@ -41,44 +56,52 @@ async function waPost(payload) {
       Authorization: `Bearer ${WHATS_TOKEN}`,
       "Content-Type": "application/json",
     },
+    timeout: 15000,
   });
 }
 
 // ===== Senders =====
 async function sendTemplate(to) {
+  // Only attach a header if you actually provided one
+  const hasHeaderImage = Boolean(TEMPLATE_HEADER_MEDIA_ID || TEMPLATE_HEADER_IMAGE_URL);
+
   const template = {
     name: TEMPLATE_NAME,
     language: { code: TEMPLATE_LANG },
   };
 
-  // add header image if provided (and template expects an IMAGE header)
-  const components = [];
-  if (TEMPLATE_HEADER_MEDIA_ID) {
-    components.push({
-      type: "header",
-      parameters: [{ type: "image", image: { id: TEMPLATE_HEADER_MEDIA_ID } }],
-    });
-  } else if (TEMPLATE_HEADER_IMAGE_URL) {
-    components.push({
-      type: "header",
-      parameters: [{ type: "image", image: { link: TEMPLATE_HEADER_IMAGE_URL } }],
-    });
+  if (hasHeaderImage) {
+    template.components = [
+      {
+        type: "header",
+        parameters: [
+          TEMPLATE_HEADER_MEDIA_ID
+            ? { type: "image", image: { id: TEMPLATE_HEADER_MEDIA_ID } }
+            : { type: "image", image: { link: TEMPLATE_HEADER_IMAGE_URL } },
+        ],
+      },
+    ];
   }
-  if (components.length) template.components = components;
 
-  const res = await waPost({
+  await waPost({
     messaging_product: "whatsapp",
     to,
     type: "template",
     template,
   });
+}
 
-  // Return message id (used to correlate status events if you want)
-  return res.data?.messages?.[0]?.id || null;
+async function sendText(to, body) {
+  await waPost({
+    messaging_product: "whatsapp",
+    to,
+    type: "text",
+    text: { body },
+  });
 }
 
 async function sendMenu(to) {
-  return waPost({
+  await waPost({
     messaging_product: "whatsapp",
     to,
     type: "interactive",
@@ -89,31 +112,24 @@ async function sendMenu(to) {
       footer: { text: "شكراً لاختيارك مجوهرات يارا" },
       action: {
         button: "عرض الخدمات",
-        sections: [{
-          title: "القائمة",
-          rows: [
-            { id: "show_products",  title: "عرض التشكيلة",   description: "خواتم • أطقم • سلاسل" },
-            { id: "show_pricing",   title: "الأسعار والعروض", description: "خصومات ومجموعات خاصة" },
-            { id: "show_location",  title: "📍 موقعنا (اللوكيشن)", description: "استلم موقعنا كلوكيشن" },
-            { id: "talk_agent",     title: "📞 خدمة العملاء",  description: "تواصل مباشر مع ممثلنا" },
-          ],
-        }],
+        sections: [
+          {
+            title: "القائمة",
+            rows: [
+              { id: "show_products",  title: "عرض التشكيلة",    description: "خواتم • أطقم • سلاسل" },
+              { id: "show_pricing",   title: "الأسعار والعروض",  description: "خصومات ومجموعات خاصة" },
+              { id: "show_location",  title: "📍 موقعنا (اللوكيشن)", description: "استلم موقعنا كلوكيشن" },
+              { id: "talk_agent",     title: "📞 خدمة العملاء",   description: "تواصل مباشر مع ممثلنا" },
+            ],
+          },
+        ],
       },
     },
   });
 }
 
-async function sendText(to, body) {
-  return waPost({
-    messaging_product: "whatsapp",
-    to,
-    type: "text",
-    text: { body },
-  });
-}
-
 async function sendLocation(to) {
-  return waPost({
+  await waPost({
     messaging_product: "whatsapp",
     to,
     type: "location",
@@ -126,25 +142,33 @@ async function sendLocation(to) {
   });
 }
 
-// ===== Agent handoff (wa.me prefilled) =====
+// ===== Agent handoff via wa.me (prefills the agent’s box) =====
 function buildAgentLink(question, waId) {
-  const localNumber = "0" + waId.slice(3); // convert 972xxxxxxxxx → 0xxxxxxxxx
-  const msg = `لقد وصلتك رسالة من "${localNumber}" والرسالة هي:\n${question}`;
-  return `https://wa.me/${AGENT_E164}?text=${encodeURIComponent(msg)}`;
+  // Convert E.164 “972xxxxxxxxx” -> local “0xxxxxxxxx”
+  const local = waId?.startsWith("972") ? "0" + waId.slice(3) : waId;
+  const msg = `لقد وصلتك رسالة من "${local}" والرسالة هي:\n${question}`;
+  const encoded = encodeURIComponent(msg);
+  return `https://wa.me/${AGENT_E164}?text=${encoded}`;
 }
 
+// Track users who picked “talk to agent” and we’re waiting for their question
 const awaitingQuestion = new Map(); // wa_id -> true
+
 async function startAgentFlow(from) {
   awaitingQuestion.set(from, true);
   await sendText(
     from,
-    "لخدمتِك بشكل أسرع، من فضلك اكتب باختصار سؤالك أو ما تريد الاستفسار عنه، وسنحوّلك لممثل خدمة العملاء."
+    "لخدمتِك بشكل أسرع، من فضلك اكتب باختصار سؤالك أو ما تريد الاستفسار عنه، وسنوفّر لك رابط محادثة مباشرة مع ممثل الخدمة."
   );
 }
+
 async function finishAgentFlow(from, userText) {
   awaitingQuestion.delete(from);
   const link = buildAgentLink(userText, from);
-  await sendText(from, `شكرًا لك! اضغط على الرابط لبدء محادثة مباشرة مع ممثل الخدمة:\n${link}`);
+  await sendText(
+    from,
+    `شكرًا لك! اضغط على الرابط لبدء محادثة مباشرة مع ممثل الخدمة (سيظهر سؤالك مهيّأً للإرسال):\n${link}`
+  );
 }
 
 // ===== Choice router (buttons & list) =====
@@ -152,7 +176,7 @@ async function handleChoice(from, idOrTitle) {
   const key = (idOrTitle || "").trim();
 
   if (key === "عرض التشكيلة" || key === "show_products") {
-    await sendText(from, "تفضل تشكيلة مجوهرات يارا: https://your-site/collection");
+    await sendText(from, "تفضّل تشكيلة مجوهرات يارا: https://your-site/collection");
   } else if (key === "الأسعار والعروض" || key === "show_pricing") {
     await sendText(from, "الأسعار والعروض الحالية: https://your-site/pricing");
   } else if (key === "الموقع" || key === "show_location") {
@@ -165,8 +189,9 @@ async function handleChoice(from, idOrTitle) {
 }
 
 // ===== Welcome throttle: once per user per 24h =====
-const WELCOME_TTL_MS = 24 * 60 * 60 * 1000; // 24h
-const welcomeCache = new Map(); // wa_id -> lastTimestamp
+const WELCOME_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const welcomeCache = new Map(); // wa_id -> lastSentTimestamp
+
 function shouldSendWelcome(waId) {
   const now = Date.now();
   const last = welcomeCache.get(waId);
@@ -176,6 +201,8 @@ function shouldSendWelcome(waId) {
   }
   return false;
 }
+
+// Clean old cache entries hourly
 setInterval(() => {
   const now = Date.now();
   for (const [waId, ts] of welcomeCache.entries()) {
@@ -183,19 +210,12 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000);
 
-// ===== Ordering fix: queue menu until template status =====
-const pendingMenuAfterTemplate = new Set(); // wa_id’s waiting for menu
-const FALLBACK_MENU_DELAY_MS = 3000; // safety: send menu if no status arrives in time
-
 // ===== Webhook verify (GET /) =====
 app.get("/", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("✅ WEBHOOK VERIFIED");
-    return res.status(200).send(challenge);
-  }
+  if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
@@ -204,84 +224,65 @@ app.post("/", async (req, res) => {
   try {
     const body = req.body;
     console.log("📥 Inbound:", JSON.stringify(body, null, 2));
+
     if (body.object !== "whatsapp_business_account") return res.sendStatus(200);
 
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
-        const value = change.value || {};
+        const v = change.value || {};
 
-        // 1) Handle STATUS callbacks first (ordering fix)
-        const statuses = value.statuses || [];
-        for (const st of statuses) {
-          const waId  = st.recipient_id;  // user number
-          const type  = st.status;        // sent | delivered | read | failed
-          const msgId = st.id;            // message id (if you need it)
-          console.log("📨 Status:", { waId, type, msgId });
+        // ignore delivery/read
+        if (v.statuses) continue;
 
-          if (pendingMenuAfterTemplate.has(waId) && (type === "sent" || type === "delivered")) {
-            pendingMenuAfterTemplate.delete(waId);
-            // send the menu now that the template is out
-            await sendMenu(waId);
-          }
-        }
-
-        // 2) Handle messages
-        const messages = value.messages || [];
-        for (const msg of messages) {
+        for (const msg of v.messages || []) {
           const from = msg.from;
-          if (!from) continue;
+          const id   = msg.id;
 
-          // quick free-text: share location
+          if (!from || alreadyProcessed(id)) continue;
+
+          // If waiting for agent question and user sent text
           const textBody = msg.text?.body?.trim();
-          if (textBody && /^(الموقع|لوكيشن|المكان|location|map)$/i.test(textBody)) {
-            await sendLocation(from);
-            continue;
-          }
-
-          // If we asked the user for their question for the agent:
           if (awaitingQuestion.get(from) && textBody) {
             await finishAgentFlow(from, textBody);
             continue;
           }
 
-          // Template quick reply buttons:
+          // free-text location keywords
+          if (textBody && /^(الموقع|لوكيشن|المكان|location|map)$/i.test(textBody)) {
+            await sendLocation(from);
+            continue;
+          }
+
+          // interactive: button
           if (msg.type === "interactive" && msg.interactive?.type === "button_reply") {
             const { id, title } = msg.interactive.button_reply || {};
             await handleChoice(from, id || title);
             continue;
           }
 
-          // Interactive list selections:
+          // interactive: list reply
           if (msg.type === "interactive" && msg.interactive?.type === "list_reply") {
             const { id, title } = msg.interactive.list_reply || {};
             await handleChoice(from, id || title);
             continue;
           }
 
-          // First message in 24h → send template, then wait for status to send menu
+          // Any other inbound: welcome (once per 24h) then menu
           if (shouldSendWelcome(from)) {
-            await sendTemplate(from);
-            pendingMenuAfterTemplate.add(from);
-
-            // Fallback: if for some reason no status arrives, send menu after a short delay
-            setTimeout(async () => {
-              if (pendingMenuAfterTemplate.has(from)) {
-                pendingMenuAfterTemplate.delete(from);
-                await sendMenu(from);
-              }
-            }, FALLBACK_MENU_DELAY_MS);
+            await sendTemplate(from);                 // send greeting first
+            await sleep(WELCOME_MENU_DELAY_MS);       // small pause to keep order
+            await sendMenu(from);                     // then the menu
           } else {
-            // Already welcomed: show menu directly
-            await sendMenu(from);
+            await sendMenu(from);                     // subsequent messages: menu only
           }
         }
       }
     }
 
     res.sendStatus(200);
-  } catch (e) {
-    console.error("❌ Webhook error:", e?.response?.data || e);
-    res.sendStatus(200); // Always ack to avoid retries
+  } catch (err) {
+    console.error("❌ Webhook error:", err?.response?.data || err);
+    res.sendStatus(200); // always ack to avoid retries
   }
 });
 
