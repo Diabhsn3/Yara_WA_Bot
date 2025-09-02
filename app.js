@@ -94,6 +94,8 @@ function markAgentWindowOpen() {
 
 // Track agent messages we send so we can retry on async status=failed(131047)
 const pendingAgentSends = new Map(); // msgId -> { payload, context, attempts }
+// Track agent window-opening template messages for async retries
+const pendingAgentOpen = new Map(); // msgId -> { context, attempts, ts }
 
 // Periodic cleanup
 setInterval(() => {
@@ -250,26 +252,33 @@ async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service
     ],
   };
 
-  await waPost({
+  const { data } = await waPost({
     messaging_product: "whatsapp",
     to: toAgentE164,
     type: "template",
     template,
   });
   markAgentWindowOpen();
+  return data?.messages?.[0]?.id || null;
 }
 
 async function ensureAgentWindowOpen(context, options = {}) {
   const force = Boolean(options.force);
   if (!force && isAgentWindowOpen()) return;
   try {
-    await sendAgentNotifyTemplate(AGENT_E164, context);
+    const msgId = await sendAgentNotifyTemplate(AGENT_E164, context);
+    if (msgId) {
+      pendingAgentOpen.set(msgId, { context, attempts: 1, ts: Date.now() });
+    }
   } catch (e) {
     const err = e?.response?.data?.error || {};
     const code = err.code;
     if (code === 131049) {
       await sleep(2000);
-      await sendAgentNotifyTemplate(AGENT_E164, context);
+      const msgId2 = await sendAgentNotifyTemplate(AGENT_E164, context);
+      if (msgId2) {
+        pendingAgentOpen.set(msgId2, { context, attempts: 2, ts: Date.now() });
+      }
     } else {
       throw e;
     }
@@ -572,6 +581,41 @@ app.post("/", async (req, res) => {
               } else if (status === "sent" || status === "delivered" || status === "read") {
                 // Successful path -> cleanup
                 pendingAgentSends.delete(msgId);
+              }
+            }
+
+            // Agent window-opening template async handling (retry on 131047/131049)
+            const openPending = pendingAgentOpen.get(msgId);
+            if (openPending) {
+              if (status === "failed") {
+                const errObj = Array.isArray(st.errors) && st.errors[0] ? st.errors[0] : null;
+                const code   = errObj?.code;
+                const details = errObj?.error_data?.details || "";
+                const { context, attempts } = openPending;
+                if (code === 131047 || /re-engagement/i.test(details) || code === 131049) {
+                  if (attempts < 3) {
+                    try {
+                      const backoff = attempts === 1 ? 2000 : 4000;
+                      await sleep(backoff);
+                      const newId = await sendAgentNotifyTemplate(AGENT_E164, context);
+                      if (newId) {
+                        pendingAgentOpen.set(newId, { context, attempts: attempts + 1, ts: Date.now() });
+                      }
+                    } catch (e) {
+                      console.error("❌ Agent open template resend failed:", e?.response?.data || e);
+                    } finally {
+                      pendingAgentOpen.delete(msgId);
+                    }
+                  } else {
+                    pendingAgentOpen.delete(msgId);
+                  }
+                } else {
+                  pendingAgentOpen.delete(msgId);
+                }
+              } else if (status === "sent" || status === "delivered" || status === "read") {
+                // Mark window open and cleanup
+                markAgentWindowOpen();
+                pendingAgentOpen.delete(msgId);
               }
             }
           }
