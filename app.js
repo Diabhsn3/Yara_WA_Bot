@@ -2,8 +2,8 @@
 // - Ordered greeting (template) ➜ single menu (no spam)
 // - Catalog link, location pin + hours
 // - Option 4 -> mini flow: Service -> Full name -> Message -> forward to agent (no photos)
-// - Agent forward: open 24h window only if needed, then send one text with a deep link
-// - Handles Meta 131047 (re-engagement) and 131049 (ecosystem throttle)
+// - Agent forward: open 24h window only if needed (no deep links)
+// - Handles Meta 131047 (re-engagement) and 131049 (ecosystem throttle) both on send AND on async webhook status
 
 const express = require("express");
 const axios = require("axios");
@@ -92,6 +92,9 @@ function markAgentWindowOpen() {
   agentWindowUntil.set(AGENT_E164, Date.now() + Math.floor(23.5 * 60 * 60 * 1000)); // 23.5h
 }
 
+// Track agent messages we send so we can retry on async status=failed(131047)
+const pendingAgentSends = new Map(); // msgId -> { payload, context, attempts }
+
 // Periodic cleanup
 setInterval(() => {
   const now = Date.now();
@@ -100,6 +103,11 @@ setInterval(() => {
   for (const [k, ts] of menuShownRecently.entries())
     if (now - ts > 60 * 60 * 1000) menuShownRecently.delete(k);
   if (menuSentForTemplate.size > 10000) menuSentForTemplate.clear();
+
+  // clear stale pending agent sends (older than ~30min)
+  for (const [k, v] of pendingAgentSends.entries()) {
+    if (v.ts && now - v.ts > 30 * 60 * 1000) pendingAgentSends.delete(k);
+  }
 }, 60 * 1000);
 
 // ===== WhatsApp Core =====
@@ -138,16 +146,17 @@ async function sendTemplate(to) {
     template,
   });
 
-  return data?.messages?.[0]?.id; // WA id of template message
+  return data?.messages?.[0]?.id || null; // WA id of template message
 }
 
 async function sendText(to, body) {
-  await waPost({
+  const { data } = await waPost({
     messaging_product: "whatsapp",
     to,
     type: "text",
     text: { body },
   });
+  return data?.messages?.[0]?.id || null;
 }
 
 async function sendMenu(to) {
@@ -250,45 +259,37 @@ async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service
   markAgentWindowOpen();
 }
 
-function agentDeepLinkToCustomer(customerWaId, name, service) {
-  const opener =
-    `مرحبا ${name} 👋\n` +
-    `أنا من خدمة يارا بخصوص "${service}". كيف أقدر أساعدك؟`;
-  return `https://wa.me/${customerWaId}?text=${encodeURIComponent(opener)}`;
-}
-
 async function ensureAgentWindowOpen(context) {
   if (isAgentWindowOpen()) return;
   await sendAgentNotifyTemplate(AGENT_E164, context);
   await sleep(600);
 }
 
+// NOTE: removed deep-linking to customer per your request.
+// We keep a resilient send that can handle 131047/131049 synchronously.
 async function safeSendToAgent(payload, openContext) {
+  // Try once
   try {
-    await waPost(payload);
-    return;
+    const resp = await waPost(payload);
+    return resp?.data?.messages?.[0]?.id || null;
   } catch (e) {
     const err = e?.response?.data?.error || {};
     const code = err.code;
     const details = err?.error_data?.details || "";
 
-    // 24h window closed
+    // 24h window closed => open with template and retry
     if (code === 131047 || /re-engagement/i.test(details)) {
       await ensureAgentWindowOpen(openContext);
       await sleep(800);
-      await waPost(payload);
-      return;
+      const resp2 = await waPost(payload);
+      return resp2?.data?.messages?.[0]?.id || null;
     }
 
-    // "healthy ecosystem engagement" throttle
+    // "healthy ecosystem" throttle => short backoff & retry once
     if (code === 131049) {
-      await sleep(1500);            // short backoff
-      try {
-        await waPost(payload);      // retry once
-        return;
-      } catch (e2) {
-        throw e2;
-      }
+      await sleep(1500);
+      const resp3 = await waPost(payload);
+      return resp3?.data?.messages?.[0]?.id || null;
     }
 
     throw e;
@@ -297,9 +298,8 @@ async function safeSendToAgent(payload, openContext) {
 
 async function forwardTextToAgentOpenWindow({ name, service, message, fromWaId }) {
   const local = localize(fromWaId);
-  const deepLink = agentDeepLinkToCustomer(fromWaId, name, service);
 
-  // 1) Open only if needed
+  // 1) Open only if needed via approved template
   await ensureAgentWindowOpen({
     name,
     localNumber: local,
@@ -307,25 +307,37 @@ async function forwardTextToAgentOpenWindow({ name, service, message, fromWaId }
     message,
   });
 
-  // 2) One text (no burst). If it fails with 131047/131049 we handle in safeSendToAgent
+  // 2) Build single text to agent (NO LINKS)
   const body =
     "تفاصيل الطلب:\n" +
     `الاسم: ${name}\n` +
     `الرقم: ${local}\n` +
     `الخدمة: ${service}\n` +
-    `الرسالة: ${message}\n\n` +
-    "رابط المحادثة المباشرة مع الزبون:\n" +
-    deepLink;
+    `الرسالة: ${message}`;
 
-  await safeSendToAgent(
-    {
-      messaging_product: "whatsapp",
-      to: AGENT_E164,
-      type: "text",
-      text: { body },
-    },
-    { name, localNumber: local, service, message }
-  );
+  const payload = {
+    messaging_product: "whatsapp",
+    to: AGENT_E164,
+    type: "text",
+    text: { body },
+  };
+
+  // 3) Send safely; keep for async retry if Meta returns failure later via webhook
+  const msgId = await safeSendToAgent(payload, {
+    name,
+    localNumber: local,
+    service,
+    message,
+  });
+
+  if (msgId) {
+    pendingAgentSends.set(msgId, {
+      payload,
+      context: { name, localNumber: local, service, message },
+      attempts: 1,
+      ts: Date.now(),
+    });
+  }
 }
 
 // ===== Agent mini-flow (Option 4) — no photos =====
@@ -405,10 +417,11 @@ async function handleCustomerMessage(waId, textBody) {
       message: st.message,
       fromWaId: waId,
     });
+
     await sendText(
-  waId,
-  "تم استلام رسالتك بنجاح ✅\nسيتواصل معك فريق خدمة العملاء في أقرب وقت ممكن، وذلك خلال مدة أقصاها 24 ساعة.\nشكرًا لتواصلك معنا 💎"
-);
+      waId,
+      "تم استلام رسالتك بنجاح ✅\nسيتواصل معك فريق خدمة العملاء في أقرب وقت ممكن، وذلك خلال مدة أقصاها 24 ساعة.\nشكرًا لتواصلك معنا 💎"
+    );
 
   } catch (err) {
     console.error("❌ Forward to agent failed:", err?.response?.data || err);
@@ -462,23 +475,69 @@ app.post("/", async (req, res) => {
       for (const change of entry.changes || []) {
         const v = change.value || {};
 
-        // --- A) STATUS callbacks: keep order greeting ➜ menu (only on 'sent') ---
+        // --- A) STATUS callbacks ---
         if (Array.isArray(v.statuses) && v.statuses.length) {
           for (const st of v.statuses) {
-            const waId   = st?.recipient_id; // customer wa_id
+            const waId   = st?.recipient_id; // customer wa_id (or agent E164 for our case)
             const msgId  = st?.id;           // message id whose status changed
             const status = st?.status;       // sent | delivered | read | failed
 
+            // Greeting->Menu ordering (only on 'sent')
             const pendingId = pendingMenuByUser.get(waId);
-            if (!pendingId || pendingId !== msgId) continue;
-
-            if (status === "sent" && !menuSentForTemplate.has(msgId)) {
-              if (canShowMenu(waId)) {
-                await sendMenu(waId);
-                markMenuShown(waId);
+            if (pendingId && pendingId === msgId) {
+              if (status === "sent" && !menuSentForTemplate.has(msgId)) {
+                try {
+                  if (canShowMenu(waId)) {
+                    await sendMenu(waId);
+                    markMenuShown(waId);
+                  }
+                } finally {
+                  menuSentForTemplate.add(msgId);
+                  pendingMenuByUser.delete(waId);
+                }
               }
-              menuSentForTemplate.add(msgId);
-              pendingMenuByUser.delete(waId);
+            }
+
+            // Agent async failure (131047) ➜ open window with template ➜ retry once
+            const agentPending = pendingAgentSends.get(msgId);
+            if (agentPending) {
+              if (status === "failed") {
+                const errObj = Array.isArray(st.errors) && st.errors[0] ? st.errors[0] : null;
+                const code   = errObj?.code;
+                const details = errObj?.error_data?.details || "";
+
+                if (code === 131047 || /re-engagement/i.test(details)) {
+                  const { payload, context, attempts } = agentPending;
+                  if (attempts < 2) {
+                    try {
+                      await ensureAgentWindowOpen(context);
+                      await sleep(800);
+                      const resp = await waPost(payload);
+                      const newId = resp?.data?.messages?.[0]?.id || null;
+                      if (newId) {
+                        pendingAgentSends.set(newId, {
+                          payload,
+                          context,
+                          attempts: attempts + 1,
+                          ts: Date.now(),
+                        });
+                      }
+                    } catch (e) {
+                      console.error("❌ Agent resend failed:", e?.response?.data || e);
+                    } finally {
+                      pendingAgentSends.delete(msgId);
+                    }
+                  } else {
+                    pendingAgentSends.delete(msgId);
+                  }
+                } else {
+                  // Other failure types -> drop
+                  pendingAgentSends.delete(msgId);
+                }
+              } else if (status === "sent" || status === "delivered" || status === "read") {
+                // Successful path -> cleanup
+                pendingAgentSends.delete(msgId);
+              }
             }
           }
           continue;
