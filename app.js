@@ -1,13 +1,11 @@
 // app.js — Yara WhatsApp
 // - Ordered greeting (template) ➜ single menu (no spam)
 // - Catalog entries, location pin + hours
-// - Option 4 -> mini flow: Service -> Full name -> Message -> Attach photos? -> forward to agent
-// - Agent forward: open 24h window via template, then send text + photos
-// - Robust agent-sending with 131047 (re-engagement) recovery
+// - Option 4 -> mini flow: Service -> Full name -> Message -> forward to agent
+// - Agent forward: open 24h window via template, then send text with a deep-link to customer chat
 
 const express = require("express");
 const axios = require("axios");
-const FormData = require("form-data");
 
 const app = express();
 app.use(express.json());
@@ -82,7 +80,7 @@ const pendingMenuByUser   = new Map(); // wa_id -> templateMessageId (wait for s
 const menuSentForTemplate = new Set(); // templateMessageId that already triggered a menu
 
 // Agent flow state per user
-// { step, service, name, message, wantPhotos, attachments:[{mediaId}] }
+// { step, service, name, message }
 const agentFlow = new Map();
 
 // Periodic cleanup
@@ -105,42 +103,6 @@ async function waPost(payload) {
     },
     timeout: 20000,
   });
-}
-
-// Media helpers
-async function getMediaUrl(mediaId) {
-  const { data } = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
-    headers: { Authorization: `Bearer ${WHATS_TOKEN}` },
-  });
-  return { url: data.url, mime_type: data.mime_type };
-}
-async function downloadMedia(url) {
-  const resp = await axios.get(url, {
-    headers: { Authorization: `Bearer ${WHATS_TOKEN}` },
-    responseType: "arraybuffer",
-    timeout: 30000,
-  });
-  return resp.data; // Buffer
-}
-async function uploadMediaToWA(buffer, mime_type, filename = "file") {
-  const form = new FormData();
-  form.append("messaging_product", "whatsapp");
-  form.append("file", buffer, { filename, contentType: mime_type });
-  form.append("type", mime_type);
-
-  const { data } = await axios.post(
-    `https://graph.facebook.com/v23.0/${PHONE_NUMBER_ID}/media`,
-    form,
-    {
-      headers: {
-        Authorization: `Bearer ${WHATS_TOKEN}`,
-        ...form.getHeaders(),
-      },
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-    }
-  );
-  return data.id;
 }
 
 // ===== Senders =====
@@ -226,7 +188,6 @@ async function sendLocation(to) {
       address: "طمرة، شارع ابن زيدون",
     },
   });
-  // NOTE: make sure this line uses plain ASCII quotes/backticks (copy/paste safe)
   await sendText(
     to,
     "⏰ ساعات العمل:\n• السبت – الخميس: 12:00 ظهرًا – 21:00 مساءً\n• الجمعة: 15:00 ظهرًا – 21:00 مساءً"
@@ -285,7 +246,6 @@ async function safeSendToAgent(payload, openContext) {
     const code = e?.response?.data?.error?.code;
     const details = e?.response?.data?.error?.error_data?.details || "";
     if (code === 131047 || /re-engagement/i.test(details)) {
-      // Open window with template, wait, then retry once
       await sendAgentNotifyTemplate(AGENT_E164, openContext);
       await sleep(800);
       await waPost(payload);
@@ -295,8 +255,15 @@ async function safeSendToAgent(payload, openContext) {
   }
 }
 
+// Build a deep-link for the agent to jump to the customer's chat with a prefilled first line
+function agentDeepLinkToCustomer(customerWaId, name, service) {
+  const prefill = `مرحبًا ${name}، معك فريق يارا بخصوص "${service}". هل يناسبك أن نتابع هنا؟`;
+  return `https://wa.me/${customerWaId}?text=${encodeURIComponent(prefill)}`;
+}
+
 async function forwardTextToAgentOpenWindow({ name, service, message, fromWaId }) {
   const local = localize(fromWaId);
+  const deepLink = agentDeepLinkToCustomer(fromWaId, name, service);
 
   // Always open first
   await sendAgentNotifyTemplate(AGENT_E164, {
@@ -313,7 +280,8 @@ async function forwardTextToAgentOpenWindow({ name, service, message, fromWaId }
     `الاسم: ${name}\n` +
     `الرقم: ${local}\n` +
     `الخدمة: ${service}\n` +
-    `الرسالة: ${message}`;
+    `الرسالة: ${message}\n\n` +
+    `رابط المحادثة المباشرة مع الزبون:\n${deepLink}`;
 
   await safeSendToAgent(
     {
@@ -324,33 +292,8 @@ async function forwardTextToAgentOpenWindow({ name, service, message, fromWaId }
     },
     { name, localNumber: local, service, message }
   );
-  await sleep(400);
-}
 
-async function forwardImagesToAgent(attachments, openContext) {
-  let idx = 0;
-  for (const a of attachments) {
-    idx += 1;
-    try {
-      const { url, mime_type } = await getMediaUrl(a.mediaId);
-      const bin = await downloadMedia(url);
-      const newId = await uploadMediaToWA(bin, mime_type, "attachment");
-
-      await safeSendToAgent(
-        {
-          messaging_product: "whatsapp",
-          to: AGENT_E164,
-          type: "image",
-          image: { id: newId, caption: `مرفق (${idx}/${attachments.length})` },
-        },
-        openContext
-      );
-
-      await sleep(400);
-    } catch (e) {
-      console.error("❌ Forward image failed:", e?.response?.data || e);
-    }
-  }
+  await sleep(300);
 }
 
 // ===== Agent mini-flow (Option 4) =====
@@ -389,36 +332,13 @@ async function askFullName(waId) {
 async function askMessage(waId) {
   await sendText(waId, "اكتب رسالتك بالتفصيل:");
 }
-async function askIfWantsAttachments(waId) {
-  await waPost({
-    messaging_product: "whatsapp",
-    to: waId,
-    type: "interactive",
-    interactive: {
-      type: "button",
-      body: { text: "هل تريد إضافة صور مع الرسالة؟" },
-      action: {
-        buttons: [
-          { type: "reply", reply: { id: "attach_yes", title: "نعم" } },
-          { type: "reply", reply: { id: "attach_no",  title: "لا" } },
-        ],
-      },
-    },
-  });
-}
-async function askSendPhotosNow(waId) {
-  await sendText(
-    waId,
-    'أرسل حتى 3 صور الآن (ممكن صورة تلو الأخرى). عندما تنتهي اكتب كلمة: "تم"'
-  );
-}
 
 async function startAgentFlow(waId) {
-  agentFlow.set(waId, { step: "choose_service", attachments: [] });
+  agentFlow.set(waId, { step: "choose_service" });
   await sendServiceMenu(waId);
 }
 async function handleServiceChoice(waId, idOrTitle) {
-  const st = agentFlow.get(waId) || { attachments: [] };
+  const st = agentFlow.get(waId) || {};
   let service = "";
   switch ((idOrTitle || "").trim()) {
     case "svc_repair":
@@ -450,85 +370,15 @@ async function handleCustomerMessage(waId, textBody) {
   const st = agentFlow.get(waId);
   if (!st) return;
   st.message = textBody;
-  st.step = "attachments_confirm";
-  agentFlow.set(waId, st);
-  await askIfWantsAttachments(waId);
-}
-async function handleAttachmentsDecision(waId, decisionId) {
-  const st = agentFlow.get(waId);
-  if (!st) return;
-  if (decisionId === "attach_yes" || decisionId === "نعم") {
-    st.wantPhotos = true;
-    st.step = "collecting_media";
-    agentFlow.set(waId, st);
-    await askSendPhotosNow(waId);
-  } else {
-    st.wantPhotos = false;
-    st.step = "forward";
-    agentFlow.set(waId, st);
-    await forwardToAgentAndAck(waId);
-  }
-}
-async function handleIncomingImage(waId, imageObj) {
-  const st = agentFlow.get(waId);
-  if (!st || st.step !== "collecting_media") return false;
-  const mediaId = imageObj.id;
-  if (!mediaId) return true;
 
-  st.attachments = st.attachments || [];
-  if (st.attachments.length < 3) {
-    st.attachments.push({ mediaId });
-  }
-  agentFlow.set(waId, st);
-
-  if (st.attachments.length >= 3) {
-    st.step = "forward";
-    agentFlow.set(waId, st);
-    await forwardToAgentAndAck(waId);
-  } else {
-    await sendText(waId, `تم استلام الصورة (${st.attachments.length}/3). يمكنك إرسال المزيد أو اكتب "تم".`);
-  }
-  return true;
-}
-async function maybeFinishOnDoneKeyword(waId, textBody) {
-  const st = agentFlow.get(waId);
-  if (!st || st.step !== "collecting_media") return false;
-  if (!textBody) return false;
-  if (/^(تم|خلص|انتهيت|done)$/i.test(textBody.trim())) {
-    st.step = "forward";
-    agentFlow.set(waId, st);
-    await forwardToAgentAndAck(waId);
-    return true;
-  }
-  return false;
-}
-async function forwardToAgentAndAck(waId) {
-  const st = agentFlow.get(waId);
-  if (!st || !st.name || !st.service || !st.message) {
-    await sendText(waId, "نقصت بعض البيانات — سنعيد تشغيل الخدمة.");
-    resetAgentFlow(waId);
-    await startAgentFlow(waId);
-    return;
-  }
+  // Forward to agent & ack
   try {
-    const openContext = {
-      name: st.name,
-      localNumber: localize(waId),
-      service: st.service,
-      message: st.message,
-    };
-
     await forwardTextToAgentOpenWindow({
       name: st.name,
       service: st.service,
       message: st.message,
       fromWaId: waId,
     });
-
-    if (st.attachments && st.attachments.length) {
-      await forwardImagesToAgent(st.attachments, openContext);
-    }
-
     await sendText(
       waId,
       "تم إرسال رسالتك إلى فريق خدمة العملاء ✅\nسيتواصلون معك في أقرب وقت ممكن. شكرًا لتواصلك معنا."
@@ -613,15 +463,7 @@ app.post("/", async (req, res) => {
           const id   = msg.id;
           if (!from || alreadyProcessed(id)) continue;
 
-          // If in agent-flow collecting images
-          if (msg.type === "image" && msg.image?.id) {
-            const handled = await handleIncomingImage(from, msg.image);
-            if (handled) continue;
-          }
-
           const textBody = msg.text?.body?.trim();
-
-          if (await maybeFinishOnDoneKeyword(from, textBody)) continue;
 
           const st = agentFlow.get(from);
           if (st) {
@@ -630,21 +472,12 @@ app.post("/", async (req, res) => {
               await handleServiceChoice(from, id || title);
               continue;
             }
-            if (msg.type === "interactive" && msg.interactive?.type === "button_reply" && st.step === "attachments_confirm") {
-              const { id, title } = msg.interactive.button_reply || {};
-              await handleAttachmentsDecision(from, id || title);
-              continue;
-            }
             if (st.step === "ask_name" && textBody) {
               await handleName(from, textBody);
               continue;
             }
             if (st.step === "message" && textBody) {
               await handleCustomerMessage(from, textBody);
-              continue;
-            }
-            if (st.step === "collecting_media" && textBody) {
-              await sendText(from, 'أرسل حتى 3 صور الآن، أو اكتب "تم" عند الانتهاء.');
               continue;
             }
           }
