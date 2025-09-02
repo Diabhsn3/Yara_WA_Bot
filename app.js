@@ -96,6 +96,9 @@ function markAgentWindowOpen() {
 const pendingAgentSends = new Map(); // msgId -> { payload, context, attempts }
 // Track agent window-opening template messages for async retries
 const pendingAgentOpen = new Map(); // msgId -> { context, attempts, ts }
+// Lightweight global backoff for agent number after 131049 throttles
+let agentBackoffUntil = 0; // timestamp ms until which we should delay agent sends
+let lastAgentSendAt = 0;
 
 // Periodic cleanup
 setInterval(() => {
@@ -291,7 +294,15 @@ async function ensureAgentWindowOpen(context, options = {}) {
 async function safeSendToAgent(payload, openContext) {
   // Try once
   try {
+    // Respect global backoff and simple pacing
+    const now0 = Date.now();
+    if (now0 < agentBackoffUntil) {
+      await sleep(agentBackoffUntil - now0);
+    }
+    const sinceLast = now0 - lastAgentSendAt;
+    if (sinceLast < 800) await sleep(800 - sinceLast);
     const resp = await waPost(payload);
+    lastAgentSendAt = Date.now();
     return resp?.data?.messages?.[0]?.id || null;
   } catch (e) {
     const err = e?.response?.data?.error || {};
@@ -303,14 +314,29 @@ async function safeSendToAgent(payload, openContext) {
       await ensureAgentWindowOpen(openContext, { force: true });
       await sleep(2000);
       const resp2 = await waPost(payload);
+      lastAgentSendAt = Date.now();
       return resp2?.data?.messages?.[0]?.id || null;
     }
 
     // "healthy ecosystem" throttle => short backoff & retry once
     if (code === 131049) {
-      await sleep(1500);
-      const resp3 = await waPost(payload);
-      return resp3?.data?.messages?.[0]?.id || null;
+      agentBackoffUntil = Date.now() + 4000;
+      await sleep(4000);
+      try {
+        const resp3 = await waPost(payload);
+        lastAgentSendAt = Date.now();
+        return resp3?.data?.messages?.[0]?.id || null;
+      } catch (e2) {
+        const err2 = e2?.response?.data?.error || {};
+        if (err2.code === 131049) {
+          agentBackoffUntil = Date.now() + 8000;
+          await sleep(8000);
+          const resp4 = await waPost(payload);
+          lastAgentSendAt = Date.now();
+          return resp4?.data?.messages?.[0]?.id || null;
+        }
+        throw e2;
+      }
     }
 
     throw e;
@@ -533,6 +559,11 @@ app.post("/", async (req, res) => {
                     try {
                       await ensureAgentWindowOpen(context, { force: true });
                       await sleep(2000);
+                      // Apply global backoff on retry if needed
+                      const now1 = Date.now();
+                      if (now1 < agentBackoffUntil) {
+                        await sleep(agentBackoffUntil - now1);
+                      }
                       const resp = await waPost(payload);
                       const newId = resp?.data?.messages?.[0]?.id || null;
                       if (newId) {
@@ -553,9 +584,11 @@ app.post("/", async (req, res) => {
                   }
                 } else if (code === 131049) { // Healthy ecosystem throttle
                   const { payload, context, attempts } = agentPending;
-                  if (attempts < 2) {
+                  if (attempts < 3) {
                     try {
-                      await sleep(1500);
+                      const backoff = attempts === 1 ? 3000 : 6000;
+                      agentBackoffUntil = Date.now() + backoff;
+                      await sleep(backoff);
                       const resp = await waPost(payload);
                       const newId = resp?.data?.messages?.[0]?.id || null;
                       if (newId) {
@@ -593,9 +626,10 @@ app.post("/", async (req, res) => {
                 const details = errObj?.error_data?.details || "";
                 const { context, attempts } = openPending;
                 if (code === 131047 || /re-engagement/i.test(details) || code === 131049) {
-                  if (attempts < 3) {
+                  if (attempts < 5) {
                     try {
-                      const backoff = attempts === 1 ? 2000 : 4000;
+                      const backoff = attempts === 1 ? 2000 : attempts === 2 ? 4000 : attempts === 3 ? 8000 : 15000;
+                      if (code === 131049) agentBackoffUntil = Date.now() + backoff;
                       await sleep(backoff);
                       const newId = await sendAgentNotifyTemplate(AGENT_E164, context);
                       if (newId) {
