@@ -1,9 +1,9 @@
 // app.js — Yara WhatsApp
 // - Ordered greeting (template) ➜ single menu (no spam)
 // - Catalog link, location pin + hours
-// - Option 4 -> mini flow: Service -> Full name -> Message -> forward to agent
-// - Agent forward: send Utility template to open 24h window, WAIT for status, then send details
-// - If template fails (131047/131049), notify customer + provide backup link
+// - Option 4 -> mini flow: Service -> Name -> Message
+// - Agent handoff: send ONLY template (no extra follow-up text)
+// - Customer ack text updated
 
 const express = require("express");
 const axios = require("axios");
@@ -22,8 +22,8 @@ const TEMPLATE_LANG   = (process.env.TEMPLATE_LANG || "ar").trim();
 const TEMPLATE_HEADER_IMAGE_URL = (process.env.TEMPLATE_HEADER_IMAGE_URL || "").trim();
 const TEMPLATE_HEADER_MEDIA_ID  = (process.env.TEMPLATE_HEADER_MEDIA_ID  || "").trim();
 
-const AGENT_E164            = (process.env.AGENT_E164 || "972525555251").trim(); // agent number (no '+')
-const AGENT_TEMPLATE_NAME   = (process.env.AGENT_TEMPLATE_NAME || "agent_notify").trim(); // Utility template
+const AGENT_E164            = (process.env.AGENT_E164 || "972525555251").trim();
+const AGENT_TEMPLATE_NAME   = (process.env.AGENT_TEMPLATE_NAME || "agent_notify").trim();
 const AGENT_TEMPLATE_LANG   = (process.env.AGENT_TEMPLATE_LANG || "ar").trim();
 
 const BUSINESS_CATALOG_NUMBER = (process.env.BUSINESS_CATALOG_NUMBER || "972557215081").trim();
@@ -35,7 +35,7 @@ if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
 // ===== Utils & guards =====
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Dedup inbound messages (Meta retries)
+// Dedup inbound messages to avoid retries double-processing
 const processed = new Set();
 function alreadyProcessed(id) {
   if (!id) return false;
@@ -75,21 +75,11 @@ function shouldSendWelcome(waId) {
 const pendingMenuByUser   = new Map(); // wa_id -> templateMessageId
 const menuSentForTemplate = new Set(); // templateMessageId
 
-// ===== Agent flow state =====
-// { step, service, name, message }
-const agentFlow = new Map();
-
-// ===== Agent template wait queue =====
-// templateMsgId -> { fromWaId, body }
-const pendingAgentSends = new Map();
-
 setInterval(() => {
   const now = Date.now();
   for (const [k, ts] of welcomeCache) if (now - ts > WELCOME_TTL_MS) welcomeCache.delete(k);
   for (const [k, ts] of menuShownRecently) if (now - ts > 60*60*1000) menuShownRecently.delete(k);
   if (menuSentForTemplate.size > 10000) menuSentForTemplate.clear();
-  // Trim agent queue older than 10 minutes
-  for (const [k, v] of pendingAgentSends) if ((v.created || now) + 10*60*1000 < now) pendingAgentSends.delete(k);
 }, 60 * 1000);
 
 // ===== WhatsApp Core =====
@@ -184,7 +174,6 @@ async function sendCatalogLink(to) { await sendText(to, `🛍️ تفضّل ال
 function toLocal(waId) { return waId?.startsWith("972") ? "0" + waId.slice(3) : waId; }
 
 async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service, message }) {
-  // This template must be category = Utility and approved
   const template = {
     name: AGENT_TEMPLATE_NAME,
     language: { code: AGENT_TEMPLATE_LANG },
@@ -202,52 +191,9 @@ async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service
   return data?.messages?.[0]?.id;
 }
 
-async function queueAgentMessage(waId, { name, service, message }) {
-  const local = toLocal(waId);
-  // 1) Open 24h with template
-  const tmplId = await sendAgentNotifyTemplate(AGENT_E164, {
-    name, localNumber: local, service, message,
-  });
-
-  // 2) Prepare the follow-up text (to send after template status)
-  const body =
-    `تفاصيل الطلب:\n` +
-    `الاسم: ${name}\n` +
-    `الرقم: ${local}\n` +
-    `الخدمة: ${service}\n` +
-    `الرسالة: ${message}`;
-
-  pendingAgentSends.set(tmplId, {
-    fromWaId: waId,
-    created: Date.now(),
-    body,
-  });
-
-  // 3) Tell the customer immediately
-  await sendText(waId, "تم إرسال طلبك إلى فريق خدمة العملاء ✅\nسيتواصلون معك في أقرب وقت ممكن. شكرًا لتواصلك معنا.");
-}
-
-async function flushAgentQueueForTemplate(tmplId) {
-  const job = pendingAgentSends.get(tmplId);
-  if (!job) return;
-  try {
-    await waPost({ messaging_product:"whatsapp", to: AGENT_E164, type:"text", text:{ body: job.body } });
-  } catch (e) {
-    console.error("❌ Agent follow-up text failed:", e?.response?.data || e);
-  } finally {
-    pendingAgentSends.delete(tmplId);
-  }
-}
-
-function backupLinkToAgent(waId, { name, service, message }) {
-  const local = toLocal(waId);
-  const txt = encodeURIComponent(
-    `طلب جديد\nالاسم: ${name}\nالرقم: ${local}\nالخدمة: ${service}\nالرسالة: ${message}`
-  );
-  return `https://wa.me/${AGENT_E164}?text=${txt}`;
-}
-
 // ===== Agent mini-flow (Option 4) =====
+const agentFlow = new Map(); // { step, service, name, message }
+
 function resetAgentFlow(waId) { agentFlow.delete(waId); }
 
 async function sendServiceMenu(waId) {
@@ -288,9 +234,8 @@ async function handleServiceChoice(waId, idOrTitle) {
   else if (k === "svc_sell" || k === "بيع") st.service = "بيع";
   else if (k === "svc_buy" || k === "شراء") st.service = "شراء";
   else if (k === "svc_inquiry" || k === "استفسار") st.service = "استفسار";
-  else { await sendServiceMenu(waId); return;
+  else { await sendServiceMenu(waId); return; }
 
-  }
   st.step = "ask_name";
   agentFlow.set(waId, st);
   await askFullName(waId);
@@ -305,20 +250,29 @@ async function handleName(waId, text) {
 async function handleCustomerMessage(waId, text) {
   const st = agentFlow.get(waId); if (!st) return;
   st.message = text;
-  // Queue to agent (template + wait)
+
+  // Send ONLY the template to the agent
+  const local = toLocal(waId);
   try {
-    await queueAgentMessage(waId, st);
-  } catch (err) {
-    // Template send failed immediately (e.g., policy) — tell customer and give backup link
-    console.error("❌ Agent template send failed:", err?.response?.data || err);
-    const link = backupLinkToAgent(waId, st);
-    await sendText(
-      waId,
-      `تعذر إرسال الطلب تلقائيًا الآن. اضغط هذا الرابط لمراسلة فريق الخدمة مباشرةً:\n${link}`
-    );
-  } finally {
-    resetAgentFlow(waId);
+    await sendAgentNotifyTemplate(AGENT_E164, {
+      name: st.name,
+      localNumber: local,
+      service: st.service,
+      message: st.message,
+    });
+  } catch (e) {
+    console.error("❌ Agent template send failed:", e?.response?.data || e);
   }
+
+  // Acknowledge to customer (NEW message)
+  await sendText(
+    waId,
+    "تم استلام رسالتك بنجاح ✅\n" +
+    "سيتواصل معك فريق خدمة العملاء في أقرب وقت ممكن، وذلك خلال مدة أقصاها 24 ساعة.\n" +
+    "شكرًا لتواصلك معنا 💎"
+  );
+
+  resetAgentFlow(waId);
 }
 
 // ===== Main menu router =====
@@ -328,7 +282,7 @@ async function handleChoice(from, idOrTitle) {
   if (key === "open_catalog") {
     await sendCatalogLink(from);
   } else if (key === "browse_catalog") {
-    await sendCatalogLink(from); // You can later deep-link a specific set
+    await sendCatalogLink(from); // extend later to deep-link set
   } else if (key === "show_location" || key === "الموقع") {
     await sendLocation(from);
   } else if (key === "talk_agent" || key === "📞 خدمة العملاء") {
@@ -358,46 +312,21 @@ app.post("/", async (req, res) => {
       for (const change of entry.changes || []) {
         const v = change.value || {};
 
-        // A) STATUS callbacks
+        // A) STATUS callbacks – greeting -> menu on 'sent'
         if (Array.isArray(v.statuses) && v.statuses.length) {
           for (const st of v.statuses) {
             const waId   = st?.recipient_id;
             const msgId  = st?.id;
             const status = st?.status;
-            const error  = st?.errors?.[0];
 
-            // Greeting -> Menu
             const pendingId = pendingMenuByUser.get(waId);
             if (pendingId && pendingId === msgId && status === "sent" && !menuSentForTemplate.has(msgId)) {
               if (canShowMenu(waId)) { await sendMenu(waId); markMenuShown(waId); }
               menuSentForTemplate.add(msgId);
               pendingMenuByUser.delete(waId);
             }
-
-            // Agent template: on 'sent' or 'delivered' flush; on 'failed' offer backup
-            if (pendingAgentSends.has(msgId) && waId === AGENT_E164) {
-              if (status === "sent" || status === "delivered") {
-                await flushAgentQueueForTemplate(msgId);
-              } else if (status === "failed") {
-                const job = pendingAgentSends.get(msgId);
-                pendingAgentSends.delete(msgId);
-                // Tell the customer + provide manual link
-                if (job?.fromWaId) {
-                  await sendText(
-                    job.fromWaId,
-                    "تعذر إرسال الطلب تلقائيًا إلى فريق الخدمة الآن. سنحاول تحسين المسار.\n" +
-                    "يمكنك أيضًا مراسلتهم مباشرة عبر هذا الرابط:"
-                  );
-                  // Reconstruct link text from job.body
-                  const linkTxt = encodeURIComponent(job.body);
-                  const backup = `https://wa.me/${AGENT_E164}?text=${linkTxt}`;
-                  await sendText(job.fromWaId, backup);
-                }
-                console.error("❌ Agent template failed:", error || st);
-              }
-            }
           }
-          return res.sendStatus(200);
+          continue;
         }
 
         // B) Inbound messages
@@ -409,14 +338,14 @@ app.post("/", async (req, res) => {
           const textBody = msg.text?.body?.trim();
 
           // Agent flow steps
-          const af = agentFlow.get(from);
-          if (af) {
-            if (msg.type === "interactive" && msg.interactive?.type === "list_reply" && af.step === "choose_service") {
+          const st = agentFlow.get(from);
+          if (st) {
+            if (msg.type === "interactive" && msg.interactive?.type === "list_reply" && st.step === "choose_service") {
               const { id, title } = msg.interactive.list_reply || {};
               await handleServiceChoice(from, id || title); continue;
             }
-            if (af.step === "ask_name" && textBody) { await handleName(from, textBody); continue; }
-            if (af.step === "message"  && textBody) { await handleCustomerMessage(from, textBody); continue; }
+            if (st.step === "ask_name" && textBody) { await handleName(from, textBody); continue; }
+            if (st.step === "message"  && textBody) { await handleCustomerMessage(from, textBody); continue; }
           }
 
           // Location keywords
@@ -445,8 +374,6 @@ app.post("/", async (req, res) => {
             }
           }
         }
-
-        return res.sendStatus(200);
       }
     }
 
