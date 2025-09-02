@@ -1,8 +1,9 @@
 // app.js — Yara WhatsApp
 // - Ordered greeting (template) ➜ single menu (no spam)
-// - Catalog entries, location pin + hours
-// - Option 4 -> mini flow: Service -> Full name -> Message -> forward to agent
-// - Agent forward: open 24h window via template, then send text with a deep-link to customer chat
+// - Catalog link, location pin + hours
+// - Option 4 -> mini flow: Service -> Full name -> Message -> forward to agent (no photos)
+// - Agent forward: open 24h window only if needed, then send one text with a deep link
+// - Handles Meta 131047 (re-engagement) and 131049 (ecosystem throttle)
 
 const express = require("express");
 const axios = require("axios");
@@ -49,7 +50,6 @@ function alreadyProcessed(id) {
 const lastMenuAt        = new Map();  // wa_id -> timestamp
 const MENU_COOLDOWN_MS  = Number(process.env.MENU_COOLDOWN_MS || 15000); // 15s
 const menuShownRecently = new Map();  // wa_id -> timestamp
-
 function canShowMenu(waId) {
   const now = Date.now();
   const last  = lastMenuAt.get(waId) || 0;
@@ -79,9 +79,18 @@ function shouldSendWelcome(waId) {
 const pendingMenuByUser   = new Map(); // wa_id -> templateMessageId (wait for status)
 const menuSentForTemplate = new Set(); // templateMessageId that already triggered a menu
 
-// Agent flow state per user
-// { step, service, name, message }
+// Agent flow state per user: { step, service, name, message }
 const agentFlow = new Map();
+
+// Agent 24h window tracking for the agent number itself
+const agentWindowUntil = new Map(); // AGENT_E164 -> timestamp (ms)
+function isAgentWindowOpen() {
+  const until = agentWindowUntil.get(AGENT_E164) || 0;
+  return Date.now() < until;
+}
+function markAgentWindowOpen() {
+  agentWindowUntil.set(AGENT_E164, Date.now() + Math.floor(23.5 * 60 * 60 * 1000)); // 23.5h
+}
 
 // Periodic cleanup
 setInterval(() => {
@@ -128,7 +137,8 @@ async function sendTemplate(to) {
     type: "template",
     template,
   });
-  return data?.messages?.[0]?.id;
+
+  return data?.messages?.[0]?.id; // WA id of template message
 }
 
 async function sendText(to, body) {
@@ -156,10 +166,10 @@ async function sendMenu(to) {
           {
             title: "القائمة",
             rows: [
-              { id: "open_catalog",   title: "عرض الكتالوج",     description: "استعراض جميع المنتجات" },
-              { id: "browse_catalog", title: "تصفح حسب الفئة",    description: "اختيار مجموعة/فئة من الكتالوج" },
-              { id: "show_location",  title: "📍 الموقع",         description: "إرسال اللوكيشن وساعات العمل" },
-              { id: "talk_agent",     title: "📞 خدمة العملاء",    description: "تواصل مع ممثل الخدمة" },
+              { id: "open_catalog",   title: "عرض الكتالوج",   description: "استعراض جميع المنتجات" },
+              { id: "browse_catalog", title: "تصفح حسب الفئة", description: "اختيار مجموعة من الكتالوج" },
+              { id: "show_location",  title: "📍 الموقع",       description: "اللوكيشن وساعات العمل" },
+              { id: "talk_agent",     title: "📞 خدمة العملاء",  description: "تواصل مع ممثل الخدمة" },
             ],
           },
         ],
@@ -177,6 +187,7 @@ async function sendMenuWithPrompt(to) {
 }
 
 async function sendLocation(to) {
+  // Pin
   await waPost({
     messaging_product: "whatsapp",
     to,
@@ -188,31 +199,31 @@ async function sendLocation(to) {
       address: "طمرة، شارع ابن زيدون",
     },
   });
+  // Hours — ASCII text/newlines only to avoid encoding issues
   await sendText(
     to,
-    "⏰ ساعات العمل:\n• السبت – الخميس: 12:00 ظهرًا – 21:00 مساءً\n• الجمعة: 15:00 ظهرًا – 21:00 مساءً"
+    "⏰ ساعات العمل:\n- السبت إلى الخميس: 12:00 ظهرا إلى 21:00 مساء\n- الجمعة: 15:00 ظهرا إلى 21:00 مساء"
   );
 }
 
 // ===== Catalog helpers =====
 const BUSINESS_PHONE_CC = "972557215081"; // your WA business phone (no +)
-function catalogLinkForCollection() {
-  return `https://wa.me/c/${BUSINESS_PHONE_CC}`;
+function catalogLinkForCollection(/*collectionId*/) {
+  return `https://wa.me/c/${BUSINESS_PHONE_CC}`; // default catalog
 }
 async function sendCatalogLink(to, variant = "new") {
   const intro =
     variant === "best"
-      ? "⭐ تفضّل أحدث المختارات الأكثر طلبًا في كاتالوجنا:"
+      ? "⭐ تفضّل أحدث المختارات الأكثر طلبا في كاتالوجنا:"
       : "🛍️ تفضّل أحدث تشكيلاتنا في الكاتالوج:";
-  await sendText(to, `${intro}\n${catalogLinkForCollection()}`);
+  await sendText(to, `${intro}\n${catalogLinkForCollection("default")}`);
 }
 
-// ===== Agent handoff (resilient) =====
+// ===== Agent handoff =====
 function localize(waId) {
   return waId?.startsWith("972") ? "0" + waId.slice(3) : waId;
 }
 
-// Open agent window with template (HSM)
 async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service, message }) {
   const template = {
     name: AGENT_TEMPLATE_NAME,
@@ -229,59 +240,82 @@ async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service
       },
     ],
   };
-  const { data } = await waPost({
+
+  await waPost({
     messaging_product: "whatsapp",
     to: toAgentE164,
     type: "template",
     template,
   });
-  return data?.messages?.[0]?.id;
+  markAgentWindowOpen();
 }
 
-// Wrapper that retries on 131047 by reopening with template
+function agentDeepLinkToCustomer(customerWaId, name, service) {
+  const opener =
+    `مرحبا ${name} 👋\n` +
+    `أنا من خدمة يارا بخصوص "${service}". كيف أقدر أساعدك؟`;
+  return `https://wa.me/${customerWaId}?text=${encodeURIComponent(opener)}`;
+}
+
+async function ensureAgentWindowOpen(context) {
+  if (isAgentWindowOpen()) return;
+  await sendAgentNotifyTemplate(AGENT_E164, context);
+  await sleep(600);
+}
+
 async function safeSendToAgent(payload, openContext) {
   try {
     await waPost(payload);
+    return;
   } catch (e) {
-    const code = e?.response?.data?.error?.code;
-    const details = e?.response?.data?.error?.error_data?.details || "";
+    const err = e?.response?.data?.error || {};
+    const code = err.code;
+    const details = err?.error_data?.details || "";
+
+    // 24h window closed
     if (code === 131047 || /re-engagement/i.test(details)) {
-      await sendAgentNotifyTemplate(AGENT_E164, openContext);
+      await ensureAgentWindowOpen(openContext);
       await sleep(800);
       await waPost(payload);
-    } else {
-      throw e;
+      return;
     }
-  }
-}
 
-// Build a deep-link for the agent to jump to the customer's chat with a prefilled first line
-function agentDeepLinkToCustomer(customerWaId, name, service) {
-  const prefill = `مرحبًا ${name}، معك فريق يارا بخصوص "${service}". هل يناسبك أن نتابع هنا؟`;
-  return `https://wa.me/${customerWaId}?text=${encodeURIComponent(prefill)}`;
+    // "healthy ecosystem engagement" throttle
+    if (code === 131049) {
+      await sleep(1500);            // short backoff
+      try {
+        await waPost(payload);      // retry once
+        return;
+      } catch (e2) {
+        throw e2;
+      }
+    }
+
+    throw e;
+  }
 }
 
 async function forwardTextToAgentOpenWindow({ name, service, message, fromWaId }) {
   const local = localize(fromWaId);
   const deepLink = agentDeepLinkToCustomer(fromWaId, name, service);
 
-  // Always open first
-  await sendAgentNotifyTemplate(AGENT_E164, {
+  // 1) Open only if needed
+  await ensureAgentWindowOpen({
     name,
     localNumber: local,
     service,
     message,
   });
 
-  await sleep(600);
-
+  // 2) One text (no burst). If it fails with 131047/131049 we handle in safeSendToAgent
   const body =
-    `تفاصيل الطلب:\n` +
+    "تفاصيل الطلب:\n" +
     `الاسم: ${name}\n` +
     `الرقم: ${local}\n` +
     `الخدمة: ${service}\n` +
     `الرسالة: ${message}\n\n` +
-    `رابط المحادثة المباشرة مع الزبون:\n${deepLink}`;
+    "رابط المحادثة المباشرة مع الزبون:\n" +
+    deepLink;
 
   await safeSendToAgent(
     {
@@ -292,14 +326,11 @@ async function forwardTextToAgentOpenWindow({ name, service, message, fromWaId }
     },
     { name, localNumber: local, service, message }
   );
-
-  await sleep(300);
 }
 
-// ===== Agent mini-flow (Option 4) =====
-function resetAgentFlow(waId) {
-  agentFlow.delete(waId);
-}
+// ===== Agent mini-flow (Option 4) — no photos =====
+function resetAgentFlow(waId) { agentFlow.delete(waId); }
+
 async function sendServiceMenu(waId) {
   await waPost({
     messaging_product: "whatsapp",
@@ -326,12 +357,8 @@ async function sendServiceMenu(waId) {
     },
   });
 }
-async function askFullName(waId) {
-  await sendText(waId, "من فضلك اكتب اسمك الكامل:");
-}
-async function askMessage(waId) {
-  await sendText(waId, "اكتب رسالتك بالتفصيل:");
-}
+async function askFullName(waId)  { await sendText(waId, "من فضلك اكتب اسمك الكامل:"); }
+async function askMessage(waId)   { await sendText(waId, "اكتب رسالتك بالتفصيل:"); }
 
 async function startAgentFlow(waId) {
   agentFlow.set(waId, { step: "choose_service" });
@@ -342,16 +369,15 @@ async function handleServiceChoice(waId, idOrTitle) {
   let service = "";
   switch ((idOrTitle || "").trim()) {
     case "svc_repair":
-    case "تصليح":  service = "تصليح"; break;
+    case "تصليح":   service = "تصليح"; break;
     case "svc_sell":
-    case "بيع":    service = "بيع";    break;
+    case "بيع":     service = "بيع"; break;
     case "svc_buy":
-    case "شراء":   service = "شراء";   break;
+    case "شراء":    service = "شراء"; break;
     case "svc_inquiry":
-    case "استفسار":service = "استفسار";break;
+    case "استفسار": service = "استفسار"; break;
     default:
-      await sendServiceMenu(waId);
-      return;
+      await sendServiceMenu(waId); return;
   }
   st.service = service;
   st.step = "ask_name";
@@ -359,19 +385,19 @@ async function handleServiceChoice(waId, idOrTitle) {
   await askFullName(waId);
 }
 async function handleName(waId, textBody) {
-  const st = agentFlow.get(waId);
-  if (!st) return;
+  const st = agentFlow.get(waId); if (!st) return;
   st.name = textBody;
   st.step = "message";
   agentFlow.set(waId, st);
   await askMessage(waId);
 }
 async function handleCustomerMessage(waId, textBody) {
-  const st = agentFlow.get(waId);
-  if (!st) return;
+  const st = agentFlow.get(waId); if (!st) return;
   st.message = textBody;
+  st.step = "forward";
+  agentFlow.set(waId, st);
 
-  // Forward to agent & ack
+  // Forward to agent and ACK to customer
   try {
     await forwardTextToAgentOpenWindow({
       name: st.name,
@@ -380,9 +406,10 @@ async function handleCustomerMessage(waId, textBody) {
       fromWaId: waId,
     });
     await sendText(
-      waId,
-      "تم إرسال رسالتك إلى فريق خدمة العملاء ✅\nسيتواصلون معك في أقرب وقت ممكن. شكرًا لتواصلك معنا."
-    );
+  waId,
+  "تم استلام رسالتك بنجاح ✅\nسيتواصل معك فريق خدمة العملاء في أقرب وقت ممكن، وذلك خلال مدة أقصاها 24 ساعة.\nشكرًا لتواصلك معنا 💎"
+);
+
   } catch (err) {
     console.error("❌ Forward to agent failed:", err?.response?.data || err);
     await sendText(
@@ -398,9 +425,9 @@ async function handleCustomerMessage(waId, textBody) {
 async function handleChoice(from, idOrTitle) {
   const key = (idOrTitle || "").trim();
 
-  if (key === "open_catalog") {
+  if (key === "open_catalog" || key === "show_catalog_new") {
     await sendCatalogLink(from, "new");
-  } else if (key === "browse_catalog") {
+  } else if (key === "browse_catalog" || key === "show_catalog_best") {
     await sendCatalogLink(from, "best");
   } else if (key === "show_location" || key === "الموقع") {
     await sendLocation(from);
@@ -435,12 +462,12 @@ app.post("/", async (req, res) => {
       for (const change of entry.changes || []) {
         const v = change.value || {};
 
-        // Status callbacks: keep order greeting ➜ menu (only on 'sent')
+        // --- A) STATUS callbacks: keep order greeting ➜ menu (only on 'sent') ---
         if (Array.isArray(v.statuses) && v.statuses.length) {
           for (const st of v.statuses) {
-            const waId   = st?.recipient_id;
-            const msgId  = st?.id;
-            const status = st?.status;
+            const waId   = st?.recipient_id; // customer wa_id
+            const msgId  = st?.id;           // message id whose status changed
+            const status = st?.status;       // sent | delivered | read | failed
 
             const pendingId = pendingMenuByUser.get(waId);
             if (!pendingId || pendingId !== msgId) continue;
@@ -457,7 +484,7 @@ app.post("/", async (req, res) => {
           continue;
         }
 
-        // Inbound from user
+        // --- B) Inbound messages from the user ---
         for (const msg of v.messages || []) {
           const from = msg.from;
           const id   = msg.id;
@@ -465,6 +492,7 @@ app.post("/", async (req, res) => {
 
           const textBody = msg.text?.body?.trim();
 
+          // Agent flow steps
           const st = agentFlow.get(from);
           if (st) {
             if (msg.type === "interactive" && msg.interactive?.type === "list_reply" && st.step === "choose_service") {
@@ -482,13 +510,13 @@ app.post("/", async (req, res) => {
             }
           }
 
-          // Location keywords
+          // Location keywords (outside the agent flow)
           if (textBody && /^(الموقع|لوكيشن|المكان|location|map)$/i.test(textBody)) {
             await sendLocation(from);
             continue;
           }
 
-          // Interactive replies (main menu)
+          // Interactive replies from main menu
           if (msg.type === "interactive") {
             if (msg.interactive?.type === "button_reply") {
               const { id, title } = msg.interactive.button_reply || {};
@@ -502,12 +530,12 @@ app.post("/", async (req, res) => {
             }
           }
 
-          // Free text outside flow
+          // Non-interactive free text (not in agent-flow):
           if (textBody) {
             if (shouldSendWelcome(from)) {
               const templateMsgId = await sendTemplate(from);
               if (templateMsgId) {
-                pendingMenuByUser.set(from, templateMsgId);
+                pendingMenuByUser.set(from, templateMsgId); // wait for status to send menu
               } else {
                 if (canShowMenu(from)) {
                   await sendMenu(from);
@@ -529,7 +557,7 @@ app.post("/", async (req, res) => {
     res.sendStatus(200);
   } catch (err) {
     console.error("❌ Webhook error:", err?.response?.data || err);
-    res.sendStatus(200);
+    res.sendStatus(200); // Always ACK
   }
 });
 
