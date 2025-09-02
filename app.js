@@ -236,6 +236,49 @@ async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service
   return data?.messages?.[0]?.id;
 }
 
+// Open agent window reliably
+async function ensureAgentWindowOpen(context) {
+  try {
+    const id = await sendAgentNotifyTemplate(AGENT_E164, context);
+    if (!id) throw new Error("No template id returned for agent window open");
+    await sleep(1500);
+    return id;
+  } catch (e) {
+    const code = e?.response?.data?.error?.code;
+    if (code === 131049) {
+      await sleep(2000);
+      const id2 = await sendAgentNotifyTemplate(AGENT_E164, context);
+      await sleep(1500);
+      return id2;
+    }
+    throw e;
+  }
+}
+
+// Safe send to agent with 24h + throttle handling
+async function safeSendAgent(payload, context) {
+  try {
+    const resp = await waPost(payload);
+    return resp?.data?.messages?.[0]?.id;
+  } catch (e) {
+    const err = e?.response?.data?.error || {};
+    const code = err.code;
+    const details = err?.error_data?.details || "";
+    if (code === 131047 || /re-engagement/i.test(details)) {
+      await ensureAgentWindowOpen(context);
+      await sleep(1500);
+      const resp2 = await waPost(payload);
+      return resp2?.data?.messages?.[0]?.id;
+    }
+    if (code === 131049) {
+      await sleep(2000);
+      const resp3 = await waPost(payload);
+      return resp3?.data?.messages?.[0]?.id;
+    }
+    throw e;
+  }
+}
+
 // Queue messages to agent and send AFTER we get template status
 async function queueAgentMessagesFrom(waId, { name, service, message }) {
   const local = toLocal(waId);
@@ -253,6 +296,7 @@ async function queueAgentMessagesFrom(waId, { name, service, message }) {
     fromWaId: waId,
     created: Date.now(),
     flushed: false,
+    context: { name, localNumber: local, service, message },
     payloads: [
       { kind: "text", body: textBody }
     ],
@@ -283,12 +327,12 @@ async function flushAgentQueueForTemplate(tmplId) {
   for (const p of job.payloads) {
     try {
       if (p.kind === "text") {
-        await waPost({ messaging_product:"whatsapp", to: AGENT_E164, type:"text", text:{ body: p.body } });
+        await safeSendAgent({ messaging_product:"whatsapp", to: AGENT_E164, type:"text", text:{ body: p.body } }, job.context);
       } else if (p.kind === "image") {
         const { url, mime_type } = await getMediaUrl(p.mediaId);
         const bin = await downloadMedia(url);
         const newId = await uploadMediaToWA(bin, mime_type, "attachment");
-        await waPost({ messaging_product:"whatsapp", to: AGENT_E164, type:"image", image:{ id: newId, caption: p.caption } });
+        await safeSendAgent({ messaging_product:"whatsapp", to: AGENT_E164, type:"image", image:{ id: newId, caption: p.caption } }, job.context);
       }
       await sleep(200);
     } catch (e) {
