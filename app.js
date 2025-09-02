@@ -237,7 +237,7 @@ async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service
 }
 
 // Queue messages to agent and send AFTER we get template status
-async function queueAgentMessagesFrom(waId, { name, service, message, attachments }) {
+async function queueAgentMessagesFrom(waId, { name, service, message }) {
   const local = toLocal(waId);
 
   // 1) Open 24h window via template
@@ -245,7 +245,7 @@ async function queueAgentMessagesFrom(waId, { name, service, message, attachment
     name, localNumber: local, service, message
   });
 
-  // 2) Build queue (text + images)
+  // 2) Build queue (text only)
   const textBody =
     `تفاصيل الطلب:\nالاسم: ${name}\nالرقم: ${local}\nالخدمة: ${service}\nالرسالة: ${message}`;
 
@@ -253,13 +253,9 @@ async function queueAgentMessagesFrom(waId, { name, service, message, attachment
     fromWaId: waId,
     created: Date.now(),
     payloads: [
-      { kind: "text", body: textBody },
-      ...(attachments || []).map((a) => ({ kind: "image", mediaId: a.mediaId, caption: `مرفق - ${name} / ${service}` }))
+      { kind: "text", body: textBody }
     ],
   });
-
-  // 3) Tell the customer
-  await sendText(waId, "تم إرسال طلبك إلى فريق خدمة العملاء ✅\nسيتواصلون معك في أقرب وقت ممكن. شكرًا لتواصلك معنا.");
 }
 
 // Send everything in the queued payloads to agent (called when template status arrives)
@@ -315,31 +311,14 @@ async function sendServiceMenu(waId) {
 }
 async function askFullName(waId) { await sendText(waId, "من فضلك اكتب اسمك الكامل:"); }
 async function askMessage(waId)  { await sendText(waId, "اكتب رسالتك بالتفصيل:"); }
-async function askIfWantsAttachments(waId) {
-  await waPost({
-    messaging_product: "whatsapp",
-    to: waId,
-    type: "interactive",
-    interactive: {
-      type: "button",
-      body: { text: "هل تريد إضافة صور مع الرسالة؟" },
-      action: { buttons: [
-        { type: "reply", reply: { id: "attach_yes", title: "نعم" } },
-        { type: "reply", reply: { id: "attach_no",  title: "لا" } },
-      ]},
-    },
-  });
-}
-async function askSendPhotosNow(waId) {
-  await sendText(waId, "أرسل حتى 3 صور الآن (واحدة تلو الأخرى). عند الانتهاء اكتب: تم");
-}
+// attachments flow removed
 
 async function startAgentFlow(waId) {
-  agentFlow.set(waId, { step: "choose_service", attachments: [] });
+  agentFlow.set(waId, { step: "choose_service" });
   await sendServiceMenu(waId);
 }
 async function handleServiceChoice(waId, idOrTitle) {
-  const st = agentFlow.get(waId) || { attachments: [] };
+  const st = agentFlow.get(waId) || {};
   const k = (idOrTitle || "").trim();
   if (k === "svc_repair" || k === "تصليح") st.service = "تصليح";
   else if (k === "svc_sell" || k === "بيع") st.service = "بيع";
@@ -361,24 +340,13 @@ async function handleName(waId, text) {
 async function handleCustomerMessage(waId, text) {
   const st = agentFlow.get(waId); if (!st) return;
   st.message = text;
-  st.step = "attachments_confirm";
   agentFlow.set(waId, st);
-  await askIfWantsAttachments(waId);
-}
-async function handleAttachmentsDecision(waId, choice) {
-  const st = agentFlow.get(waId); if (!st) return;
-  if (choice === "attach_yes" || choice === "نعم") {
-    st.wantPhotos = true;
-    st.step = "collecting_media";
-    agentFlow.set(waId, st);
-    await askSendPhotosNow(waId);
-  } else {
-    st.wantPhotos = false;
-    st.step = "forward";
-    agentFlow.set(waId, st);
-    await queueAgentMessagesFrom(waId, st);
-    resetAgentFlow(waId);
-  }
+  await queueAgentMessagesFrom(waId, st);
+  await sendText(
+    waId,
+    "تم استلام رسالتك بنجاح ✅\nسيتواصل معك فريق خدمة العملاء في أقرب وقت ممكن، وذلك خلال مدة أقصاها 24 ساعة.\nشكرًا لتواصلك معنا 💎"
+  );
+  resetAgentFlow(waId);
 }
 async function handleIncomingImage(waId, imageObj) {
   const st = agentFlow.get(waId);
