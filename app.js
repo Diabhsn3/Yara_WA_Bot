@@ -1,49 +1,37 @@
-// app.js — Yara WhatsApp: ordered greeting ➜ single menu (no spam)
-// - Greeting template (optionally with header image), once/24h
-// - Menu (interactive list) sent once after template 'sent' status
-// - If user types free text instead of choosing: prompt + menu (cooldown)
-// - Location pin + hours
-// - Agent handoff via DIRECT FORWARD to AGENT_E164 (no wa.me link)
-// - Collect service → name → message; include local phone (0xxxxxxxxx) in forward
-// - Catalog deep link
+// app.js — Yara WhatsApp
+// - Ordered greeting (template) ➜ single menu (no spam)
+// - Catalog entries, location pin + hours
+// - Option 4 -> mini flow: Service -> Full name -> Message -> Attach photos? -> forward to agent
+// - Agent forward: open 24h window via template, then send text + photos
 
 const express = require("express");
 const axios = require("axios");
+const FormData = require("form-data");
 
 const app = express();
 app.use(express.json());
 
 // ===== ENV =====
 const PORT            = process.env.PORT || 3000;
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;                 // webhook verify secret
-const WHATS_TOKEN     = process.env.WHATS_TOKEN;                  // WA access token
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;              // e.g. 743488178852069
+const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
+const WHATS_TOKEN     = process.env.WHATS_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
-const TEMPLATE_NAME   = process.env.TEMPLATE_NAME || "greetings_2";
-const TEMPLATE_LANG   = process.env.TEMPLATE_LANG || "ar";
-const TEMPLATE_HEADER_IMAGE_URL =
-  (process.env.TEMPLATE_HEADER_IMAGE_URL || "").trim();           // public URL if header=image
-const TEMPLATE_HEADER_MEDIA_ID =
-  (process.env.TEMPLATE_HEADER_MEDIA_ID || "").trim();            // media id if uploaded
+const TEMPLATE_NAME   = (process.env.TEMPLATE_NAME || "greetings_2").trim();
+const TEMPLATE_LANG   = (process.env.TEMPLATE_LANG || "ar").trim();
+const TEMPLATE_HEADER_IMAGE_URL = (process.env.TEMPLATE_HEADER_IMAGE_URL || "").trim();
+const TEMPLATE_HEADER_MEDIA_ID  = (process.env.TEMPLATE_HEADER_MEDIA_ID  || "").trim();
 
-// Agent number to receive forwarded requests (E.164 without '+')
-const AGENT_E164 = (process.env.AGENT_E164 || "972525555251").trim();
-
-// Optional: a template to force-open the 24h window when forwarding to the agent fails.
-// Must be pre-approved and have 3 body params: name, local phone, message summary.
-// const FORWARD_TEMPLATE = process.env.FORWARD_TEMPLATE || "forward_to_agent";
-// const FORWARD_TEMPLATE_LANG = process.env.FORWARD_TEMPLATE_LANG || "ar";
-
-// Catalog deep link (WhatsApp catalog)
-const CATALOG_PHONE_E164 = (process.env.CATALOG_PHONE_E164 || "972557215081").trim();
-const CATALOG_LINK = `https://wa.me/c/${CATALOG_PHONE_E164}`;
+const AGENT_E164            = (process.env.AGENT_E164 || "972525555251").trim();
+const AGENT_TEMPLATE_NAME   = (process.env.AGENT_TEMPLATE_NAME || "agent_notify").trim();
+const AGENT_TEMPLATE_LANG   = (process.env.AGENT_TEMPLATE_LANG || "ar").trim();
 
 if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
   console.error("❌ Missing WHATS_TOKEN or PHONE_NUMBER_ID env vars.");
 }
 
 // ===== Utils & guards =====
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Dedup inbound message IDs (avoid double processing on Meta retries)
 const processed = new Set();
@@ -59,9 +47,9 @@ function alreadyProcessed(id) {
 }
 
 // Per-user throttles
-const lastMenuAt            = new Map();  // wa_id -> timestamp
-const MENU_COOLDOWN_MS      = Number(process.env.MENU_COOLDOWN_MS || 15000); // 15s
-const menuShownRecently     = new Map();  // wa_id -> timestamp (extra spam guard)
+const lastMenuAt        = new Map();  // wa_id -> timestamp
+const MENU_COOLDOWN_MS  = Number(process.env.MENU_COOLDOWN_MS || 15000); // 15s
+const menuShownRecently = new Map();  // wa_id -> timestamp
 
 function canShowMenu(waId) {
   const now = Date.now();
@@ -88,21 +76,13 @@ function shouldSendWelcome(waId) {
   return false;
 }
 
-// ====== Agent flow state (service → name → message) ======
-/**
- * agentFlow per user:
- * {
- *   step: 'service' | 'name' | 'message',
- *   service?: 'تصليح'|'بيع'|'شراء'|'استفسار',
- *   name?: string
- * }
- */
-const agentFlow = new Map(); // wa_id -> state object
-function resetAgentFlow(waId) { agentFlow.delete(waId); }
-
 // Greeting→Menu ordering state
 const pendingMenuByUser   = new Map(); // wa_id -> templateMessageId (wait for status)
 const menuSentForTemplate = new Set(); // templateMessageId that already triggered a menu
+
+// Agent flow state per user
+// { step, service, name, message, wantPhotos, attachments:[{mediaId, mime}] }
+const agentFlow = new Map();
 
 // Periodic cleanup
 setInterval(() => {
@@ -122,8 +102,44 @@ async function waPost(payload) {
       Authorization: `Bearer ${WHATS_TOKEN}`,
       "Content-Type": "application/json",
     },
-    timeout: 15000,
+    timeout: 20000,
   });
+}
+
+// Media: get download URL, download, re-upload to our number, then return new media id
+async function getMediaUrl(mediaId) {
+  const { data } = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
+    headers: { Authorization: `Bearer ${WHATS_TOKEN}` },
+  });
+  return { url: data.url, mime_type: data.mime_type };
+}
+async function downloadMedia(url) {
+  const resp = await axios.get(url, {
+    headers: { Authorization: `Bearer ${WHATS_TOKEN}` },
+    responseType: "arraybuffer",
+    timeout: 30000,
+  });
+  return resp.data; // Buffer
+}
+async function uploadMediaToWA(buffer, mime_type, filename = "file") {
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("file", buffer, { filename, contentType: mime_type });
+  form.append("type", mime_type);
+
+  const { data } = await axios.post(
+    `https://graph.facebook.com/v23.0/${PHONE_NUMBER_ID}/media`,
+    form,
+    {
+      headers: {
+        Authorization: `Bearer ${WHATS_TOKEN}`,
+        ...form.getHeaders(),
+      },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    }
+  );
+  return data.id; // new media id
 }
 
 // ===== Senders =====
@@ -150,8 +166,7 @@ async function sendTemplate(to) {
     template,
   });
 
-  // Return WA message id of the template (used to match status)
-  return data?.messages?.[0]?.id;
+  return data?.messages?.[0]?.id; // WA id of template message
 }
 
 async function sendText(to, body) {
@@ -163,7 +178,6 @@ async function sendText(to, body) {
   });
 }
 
-// ===== Main menu (with catalog) =====
 async function sendMenu(to) {
   await waPost({
     messaging_product: "whatsapp",
@@ -180,10 +194,10 @@ async function sendMenu(to) {
           {
             title: "القائمة",
             rows: [
-              { id: "show_catalog",      title: "🛍️ عرض الكتالوج",      description: "تصفّح كل المنتجات والصور" },
-              { id: "catalog_help",      title: "🧭 مساعدة في الكتالوج", description: "اكتب اسم الصنف لنرشدك" },
-              { id: "show_location",     title: "📍 موقعنا (اللوكيشن)",  description: "استلم موقعنا كلوكيشن" },
-              { id: "talk_agent",        title: "📞 خدمة العملاء",       description: "تواصل مباشر مع ممثلنا" },
+              { id: "show_catalog_new", title: "🛍️ الكاتالوج — جديد", description: "تشكيلات جديدة" },
+              { id: "show_catalog_best", title: "⭐ الكاتالوج — الأكثر طلبًا", description: "مختارات مميزة" },
+              { id: "show_location",  title: "📍 موقعنا (اللوكيشن)", description: "استلم موقعنا كلوكيشن" },
+              { id: "talk_agent",     title: "📞 خدمة العملاء",    description: "تواصل مباشر مع ممثلنا" },
             ],
           },
         ],
@@ -195,13 +209,12 @@ async function sendMenu(to) {
 async function sendMenuWithPrompt(to) {
   await sendText(
     to,
-    "لفهم طلبك بسرعة، اختر من القائمة أدناه 👇 أو اكتب \"الموقع\" للحصول على اللوكيشن. لعرض المنتجات اكتب \"كتالوج\"."
+    "لفهم طلبك بسرعة، اختر من القائمة أدناه 👇 أو اكتب \"الموقع\" للحصول على اللوكيشن."
   );
   await sendMenu(to);
 }
 
 async function sendLocation(to) {
-  // Pin
   await waPost({
     messaging_product: "whatsapp",
     to,
@@ -213,88 +226,116 @@ async function sendLocation(to) {
       address: "طمرة، شارع ابن زيدون",
     },
   });
-  // Hours
   await sendText(
     to,
     `⏰ ساعات العمل:\n• السبت – الخميس: 12:00 ظهرًا – 21:00 مساءً\n• الجمعة: 15:00 ظهرًا – 21:00 مساءً`
   );
 }
 
-// ===== DIRECT forward to agent =====
-function toLocal0(waId) {
-  // Convert E.164 "972xxxxxxxxx" to "0xxxxxxxxx"
-  if (!waId) return "";
-  if (waId.startsWith("972")) return "0" + waId.slice(3);
-  return waId;
+// ===== Catalog helpers (deep-link into your WA Catalog) =====
+const BUSINESS_PHONE_CC = "972557215081"; // your WA business phone (no +)
+function catalogLinkForCollection(collectionId) {
+  // opens the WhatsApp catalog app for this business; /browse shows collections
+  // (You can change to a specific collection deep-link if you have its code)
+  return `https://wa.me/c/${BUSINESS_PHONE_CC}`;
+}
+async function sendCatalogLink(to, variant = "new") {
+  const intro =
+    variant === "best"
+      ? "⭐ تفضّل أحدث المختارات الأكثر طلبًا في كاتالوجنا:"
+      : "🛍️ تفضّل أحدث تشكيلاتنا في الكاتالوج:";
+  await sendText(to, `${intro}\n${catalogLinkForCollection("default")}`);
 }
 
-// Try to send a text directly to the agent from your business number.
-// If it fails with a 24h-window error (e.g., 470/131045), we currently inform the user.
-// (Optional) You can implement a template fallback here if you create FORWARD_TEMPLATE.
-async function forwardToAgent({ name, service, message, fromWaId }) {
-  const local = toLocal0(fromWaId);
-  const composed =
-    `طلب جديد من بوت يارا:\n` +
+// ===== Agent handoff (OPEN 24h to agent via template, then send text + photos) =====
+function localize(waId) {
+  return waId?.startsWith("972") ? "0" + waId.slice(3) : waId;
+}
+async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service, message }) {
+  const template = {
+    name: AGENT_TEMPLATE_NAME,
+    language: { code: AGENT_TEMPLATE_LANG },
+    components: [
+      {
+        type: "body",
+        parameters: [
+          { type: "text", text: name || "-" },
+          { type: "text", text: localNumber || "-" },
+          { type: "text", text: service || "-" },
+          { type: "text", text: message || "-" },
+        ],
+      },
+    ],
+  };
+
+  const { data } = await waPost({
+    messaging_product: "whatsapp",
+    to: toAgentE164,
+    type: "template",
+    template,
+  });
+  return data?.messages?.[0]?.id;
+}
+async function forwardTextToAgentOpenWindow({ name, service, message, fromWaId }) {
+  const local = localize(fromWaId);
+
+  // 1) Open with template (unlocks 24h)
+  await sendAgentNotifyTemplate(AGENT_E164, {
+    name,
+    localNumber: local,
+    service,
+    message,
+  });
+
+  // 2) Small pause
+  await sleep(400);
+
+  // 3) Follow up with details
+  const body =
+    `تفاصيل الطلب:\n` +
     `الاسم: ${name}\n` +
     `الرقم: ${local}\n` +
     `الخدمة: ${service}\n` +
-    `الرسالة: ${message}\n` +
-    `معرّف واتساب: ${fromWaId}`;
-
-  try {
-    await waPost({
-      messaging_product: "whatsapp",
-      to: AGENT_E164,
-      type: "text",
-      text: { body: composed },
-    });
-    return { ok: true };
-  } catch (err) {
-    const data = err?.response?.data;
-    console.error("❌ forwardToAgent error:", data || err);
-
-    // // OPTIONAL TEMPLATE FALLBACK (uncomment after you create/approve a template)
-    // if (FORWARD_TEMPLATE && (data?.error?.code === 470 || data?.error?.code === 131045)) {
-    //   try {
-    //     await waPost({
-    //       messaging_product: "whatsapp",
-    //       to: AGENT_E164,
-    //       type: "template",
-    //       template: {
-    //         name: FORWARD_TEMPLATE,
-    //         language: { code: FORWARD_TEMPLATE_LANG },
-    //         components: [{
-    //           type: "body",
-    //           parameters: [
-    //             { type: "text", text: name },
-    //             { type: "text", text: local },
-    //             { type: "text", text: `${service}: ${message}` },
-    //           ],
-    //         }],
-    //       },
-    //     });
-    //     return { ok: true };
-    //   } catch (e2) {
-    //     console.error("❌ forwardToAgent template fallback error:", e2?.response?.data || e2);
-    //   }
-    // }
-
-    return { ok: false, reason: data || err };
+    `الرسالة: ${message}`;
+  await waPost({
+    messaging_product: "whatsapp",
+    to: AGENT_E164,
+    type: "text",
+    text: { body },
+  });
+}
+async function forwardImagesToAgent(attachments, caption) {
+  // For each original media id: download -> upload -> send
+  for (const a of attachments) {
+    try {
+      const { url, mime_type } = await getMediaUrl(a.mediaId);
+      const bin = await downloadMedia(url);
+      const newId = await uploadMediaToWA(bin, mime_type, "attachment");
+      await waPost({
+        messaging_product: "whatsapp",
+        to: AGENT_E164,
+        type: "image",
+        image: { id: newId, caption },
+      });
+    } catch (e) {
+      console.error("❌ Forward image failed:", e?.response?.data || e);
+    }
   }
 }
 
-// Send the service submenu (تصليح، بيع، شراء، استفسار)
-async function sendServiceMenu(to) {
-  agentFlow.set(to, { step: "service" });
+// ===== Agent mini-flow (Option 4) =====
+function resetAgentFlow(waId) {
+  agentFlow.delete(waId);
+}
+async function sendServiceMenu(waId) {
   await waPost({
     messaging_product: "whatsapp",
-    to,
+    to: waId,
     type: "interactive",
     interactive: {
       type: "list",
       header: { type: "text", text: "📞 خدمة العملاء" },
-      body:   { text: "اختر الخدمة التي تريد الاستفسار عنها:" },
-      footer: { text: "يرجى اختيار خيار واحد" },
+      body:   { text: "اختر نوع الخدمة للمتابعة:" },
       action: {
         button: "اختيار الخدمة",
         sections: [
@@ -304,7 +345,7 @@ async function sendServiceMenu(to) {
               { id: "svc_repair", title: "تصليح" },
               { id: "svc_sell",   title: "بيع" },
               { id: "svc_buy",    title: "شراء" },
-              { id: "svc_info",   title: "استفسار" },
+              { id: "svc_inquiry",title: "استفسار" },
             ],
           },
         ],
@@ -312,107 +353,180 @@ async function sendServiceMenu(to) {
     },
   });
 }
-
-async function askForName(to, serviceTitle) {
-  agentFlow.set(to, { step: "name", service: serviceTitle });
+async function askFullName(waId) {
+  await sendText(waId, "من فضلك اكتب اسمك الكامل:");
+}
+async function askMessage(waId) {
+  await sendText(waId, "اكتب رسالتك بالتفصيل:");
+}
+async function askIfWantsAttachments(waId) {
+  await waPost({
+    messaging_product: "whatsapp",
+    to: waId,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: "هل تريد إضافة صور مع الرسالة؟" },
+      action: {
+        buttons: [
+          { type: "reply", reply: { id: "attach_yes", title: "نعم" } },
+          { type: "reply", reply: { id: "attach_no",  title: "لا" } },
+        ],
+      },
+    },
+  });
+}
+async function askSendPhotosNow(waId) {
   await sendText(
-    to,
-    `ممتاز، اخترت خدمة "${serviceTitle}".\nمن فضلك اكتب اسمك الكامل:`
+    waId,
+    "أرسل حتى 3 صور الآن (ممكن صورة تلو الأخرى). عندما تنتهي اكتب كلمة: تم"
   );
 }
 
-async function askForMessage(to) {
-  const st = agentFlow.get(to);
+async function startAgentFlow(waId) {
+  agentFlow.set(waId, { step: "choose_service", attachments: [] });
+  await sendServiceMenu(waId);
+}
+async function handleServiceChoice(waId, idOrTitle) {
+  const st = agentFlow.get(waId) || { attachments: [] };
+  let service = "";
+  switch ((idOrTitle || "").trim()) {
+    case "svc_repair":
+    case "تصليح":
+      service = "تصليح"; break;
+    case "svc_sell":
+    case "بيع":
+      service = "بيع"; break;
+    case "svc_buy":
+    case "شراء":
+      service = "شراء"; break;
+    case "svc_inquiry":
+    case "استفسار":
+      service = "استفسار"; break;
+    default:
+      await sendServiceMenu(waId);
+      return;
+  }
+  st.service = service;
+  st.step = "ask_name";
+  agentFlow.set(waId, st);
+  await askFullName(waId);
+}
+async function handleName(waId, textBody) {
+  const st = agentFlow.get(waId);
   if (!st) return;
+  st.name = textBody;
   st.step = "message";
-  agentFlow.set(to, st);
-  await sendText(
-    to,
-    "شكرًا لك.\nالآن اكتب الرسالة / سؤالك بالتفصيل لكي نرسلها لممثل خدمة العملاء:"
-  );
+  agentFlow.set(waId, st);
+  await askMessage(waId);
 }
+async function handleCustomerMessage(waId, textBody) {
+  const st = agentFlow.get(waId);
+  if (!st) return;
+  st.message = textBody;
+  st.step = "attachments_confirm";
+  agentFlow.set(waId, st);
+  await askIfWantsAttachments(waId);
+}
+async function handleAttachmentsDecision(waId, decisionId) {
+  const st = agentFlow.get(waId);
+  if (!st) return;
+  if (decisionId === "attach_yes" || decisionId === "نعم") {
+    st.wantPhotos = true;
+    st.step = "collecting_media";
+    agentFlow.set(waId, st);
+    await askSendPhotosNow(waId);
+  } else {
+    st.wantPhotos = false;
+    st.step = "forward";
+    agentFlow.set(waId, st);
+    await forwardToAgentAndAck(waId);
+  }
+}
+async function handleIncomingImage(waId, imageObj) {
+  const st = agentFlow.get(waId);
+  if (!st || st.step !== "collecting_media") return false;
+  const mediaId = imageObj.id; // incoming customer image id
+  if (!mediaId) return true;
 
-async function finishAgentFlow(to, userMessage) {
-  const st = agentFlow.get(to);
-  if (!st || st.step !== "message" || !st.name || !st.service) {
-    resetAgentFlow(to);
-    await sendText(to, "حدث خطأ بسيط في جمع البيانات. لنحاول من جديد.");
-    await sendServiceMenu(to);
+  st.attachments = st.attachments || [];
+  if (st.attachments.length < 3) {
+    st.attachments.push({ mediaId });
+  }
+  agentFlow.set(waId, st);
+
+  if (st.attachments.length >= 3) {
+    st.step = "forward";
+    agentFlow.set(waId, st);
+    await forwardToAgentAndAck(waId);
+  } else {
+    await sendText(waId, `تم استلام الصورة (${st.attachments.length}/3). يمكنك إرسال المزيد أو اكتب "تم".`);
+  }
+  return true;
+}
+async function maybeFinishOnDoneKeyword(waId, textBody) {
+  const st = agentFlow.get(waId);
+  if (!st || st.step !== "collecting_media") return false;
+  if (!textBody) return false;
+  if (/^(تم|خلص|انتهيت|done)$/i.test(textBody.trim())) {
+    st.step = "forward";
+    agentFlow.set(waId, st);
+    await forwardToAgentAndAck(waId);
+    return true;
+  }
+  return false;
+}
+async function forwardToAgentAndAck(waId) {
+  const st = agentFlow.get(waId);
+  if (!st || !st.name || !st.service || !st.message) {
+    await sendText(waId, "نقصت بعض البيانات — سنعيد تشغيل الخدمة.");
+    resetAgentFlow(waId);
+    await startAgentFlow(waId);
     return;
   }
-  st.message = userMessage;
-
-  // Forward directly to agent
-  const result = await forwardToAgent({
-    name: st.name,
-    service: st.service,
-    message: st.message,
-    fromWaId: to,
-  });
-
-  resetAgentFlow(to);
-
-  if (result.ok) {
+  try {
+    await forwardTextToAgentOpenWindow({
+      name: st.name,
+      service: st.service,
+      message: st.message,
+      fromWaId: waId,
+    });
+    if (st.attachments && st.attachments.length) {
+      const cap = `مرفقات (${st.attachments.length}) لطلب: ${st.name} / ${st.service}`;
+      await forwardImagesToAgent(st.attachments, cap);
+    }
     await sendText(
-      to,
+      waId,
       "تم إرسال رسالتك إلى فريق خدمة العملاء ✅\nسيتواصلون معك في أقرب وقت ممكن. شكرًا لتواصلك معنا."
     );
-  } else {
+  } catch (err) {
+    console.error("❌ Forward to agent failed:", err?.response?.data || err);
     await sendText(
-      to,
-      "تعذر إرسال رسالتك إلى فريق الخدمة في الوقت الحالي. يرجى المحاولة مجددًا لاحقًا أو اختيار خدمة أخرى من القائمة."
+      waId,
+      "تعذر إرسال رسالتك الآن. سنحاول مجددًا قريبًا. إذا استمرّ ذلك، راسلنا بكلمة 'خدمة' لإعادة المحاولة."
     );
+  } finally {
+    resetAgentFlow(waId);
   }
 }
 
-// ===== Choice router =====
+// ===== Choice router (main menu) =====
 async function handleChoice(from, idOrTitle) {
   const key = (idOrTitle || "").trim();
 
-  // Catalog
-  if (key === "show_catalog" || key === "🛍️ عرض الكتالوج") {
-    await sendText(
-      from,
-      `تفضّل كتالوج يارا الكامل:\n${CATALOG_LINK}\n\nيمكنك إضافة المنتجات إلى السلة أو إرسال استفسارك لنا هنا.`
-    );
-    return;
-  }
-  if (key === "catalog_help" || key === "🧭 مساعدة في الكتالوج") {
-    await sendText(
-      from,
-      "اكتب اسم الصنف الذي تبحث عنه (مثل: خاتم، طقم خطوبة، حلق 21) وسنرسل لك روابط مباشرة من الكتالوج."
-    );
-    return;
-  }
-
-  // Location
-  if (key === "الموقع" || key === "show_location") {
+  if (key === "show_catalog_new") {
+    await sendCatalogLink(from, "new");
+  } else if (key === "show_catalog_best") {
+    await sendCatalogLink(from, "best");
+  } else if (key === "show_location" || key === "الموقع") {
     await sendLocation(from);
-    return;
-  }
-
-  // Agent: start multi-step flow
-  if (key === "تواصل مع ممثل خدمة العملاء" || key === "talk_agent" || key === "📞 خدمة العملاء") {
-    await sendServiceMenu(from);
-    return;
-  }
-
-  // Service submenu selections
-  if (["svc_repair", "svc_sell", "svc_buy", "svc_info"].includes(key)) {
-    const titleMap = {
-      svc_repair: "تصليح",
-      svc_sell:   "بيع",
-      svc_buy:    "شراء",
-      svc_info:   "استفسار",
-    };
-    await askForName(from, titleMap[key]);
-    return;
-  }
-
-  // Unknown option → polite prompt + menu
-  if (canShowMenu(from)) {
-    await sendMenuWithPrompt(from);
-    markMenuShown(from);
+  } else if (key === "talk_agent" || key === "📞 خدمة العملاء") {
+    await startAgentFlow(from);
+  } else {
+    if (canShowMenu(from)) {
+      await sendMenuWithPrompt(from);
+      markMenuShown(from);
+    }
   }
 }
 
@@ -456,7 +570,7 @@ app.post("/", async (req, res) => {
               pendingMenuByUser.delete(waId);
             }
           }
-          continue; // handled statuses
+          continue;
         }
 
         // --- B) Inbound messages from the user ---
@@ -465,36 +579,52 @@ app.post("/", async (req, res) => {
           const id   = msg.id;
           if (!from || alreadyProcessed(id)) continue;
 
+          // Agent mini-flow image capture
+          if (msg.type === "image" && msg.image?.id) {
+            const handled = await handleIncomingImage(from, msg.image);
+            if (handled) continue;
+          }
+
           const textBody = msg.text?.body?.trim();
 
-          // If the user is in the agent flow wizard, collect inputs
+          // If we're collecting media, accept "تم" to finish
+          if (await maybeFinishOnDoneKeyword(from, textBody)) continue;
+
+          // Agent flow steps
           const st = agentFlow.get(from);
-          if (st && textBody) {
-            if (st.step === "name") {
-              st.name = textBody;
-              agentFlow.set(from, st);
-              await askForMessage(from);
+          if (st) {
+            if (msg.type === "interactive" && msg.interactive?.type === "list_reply" && st.step === "choose_service") {
+              const { id, title } = msg.interactive.list_reply || {};
+              await handleServiceChoice(from, id || title);
               continue;
             }
-            if (st.step === "message") {
-              await finishAgentFlow(from, textBody);
+            if (msg.type === "interactive" && msg.interactive?.type === "button_reply" && st.step === "attachments_confirm") {
+              const { id, title } = msg.interactive.button_reply || {};
+              await handleAttachmentsDecision(from, id || title);
+              continue;
+            }
+            if (st.step === "ask_name" && textBody) {
+              await handleName(from, textBody);
+              continue;
+            }
+            if (st.step === "message" && textBody) {
+              await handleCustomerMessage(from, textBody);
+              continue;
+            }
+            // If in collecting_media and user sends random text that isn't "تم", just remind:
+            if (st.step === "collecting_media" && textBody) {
+              await sendText(from, "أرسل حتى 3 صور الآن، أو اكتب \"تم\" عند الانتهاء.");
               continue;
             }
           }
 
-          // Location keywords immediately
+          // Location keywords (outside the agent flow)
           if (textBody && /^(الموقع|لوكيشن|المكان|location|map)$/i.test(textBody)) {
             await sendLocation(from);
             continue;
           }
 
-          // Catalog keyword shortcut
-          if (textBody && /(كتالوج|catalog)/i.test(textBody)) {
-            await sendText(from, `هذا هو كتالوج يارا:\n${CATALOG_LINK}`);
-            continue;
-          }
-
-          // Interactive replies (main menu or service submenu)
+          // Interactive replies from main menu
           if (msg.type === "interactive") {
             if (msg.interactive?.type === "button_reply") {
               const { id, title } = msg.interactive.button_reply || {};
@@ -508,7 +638,7 @@ app.post("/", async (req, res) => {
             }
           }
 
-          // Non-interactive free text (or any text that isn't a keyword)
+          // Non-interactive free text (not in agent-flow):
           if (textBody) {
             if (shouldSendWelcome(from)) {
               const templateMsgId = await sendTemplate(from);
@@ -528,8 +658,6 @@ app.post("/", async (req, res) => {
             }
             continue;
           }
-
-          // If it's neither text nor interactive (e.g., media/status echoes), do nothing.
         }
       }
     }
@@ -537,7 +665,7 @@ app.post("/", async (req, res) => {
     res.sendStatus(200);
   } catch (err) {
     console.error("❌ Webhook error:", err?.response?.data || err);
-    res.sendStatus(200); // Always ACK to avoid retries
+    res.sendStatus(200); // Always ACK
   }
 });
 
