@@ -1,12 +1,12 @@
 // app.js — Yara WhatsApp
 // - Ordered greeting (template) ➜ single menu (no spam)
-// - Catalog links, location pin + hours
-// - Option 4 -> mini flow: Service -> Name -> Message -> (optional) Photos
-// - For agent handoff: send agent template, WAIT for status, then send text + photos
+// - Catalog link, location pin + hours
+// - Option 4 -> mini flow: Service -> Full name -> Message -> forward to agent
+// - Agent forward: send Utility template to open 24h window, WAIT for status, then send details
+// - If template fails (131047/131049), notify customer + provide backup link
 
 const express = require("express");
 const axios = require("axios");
-const FormData = require("form-data");
 
 const app = express();
 app.use(express.json());
@@ -22,8 +22,8 @@ const TEMPLATE_LANG   = (process.env.TEMPLATE_LANG || "ar").trim();
 const TEMPLATE_HEADER_IMAGE_URL = (process.env.TEMPLATE_HEADER_IMAGE_URL || "").trim();
 const TEMPLATE_HEADER_MEDIA_ID  = (process.env.TEMPLATE_HEADER_MEDIA_ID  || "").trim();
 
-const AGENT_E164            = (process.env.AGENT_E164 || "972525555251").trim();
-const AGENT_TEMPLATE_NAME   = (process.env.AGENT_TEMPLATE_NAME || "agent_notify").trim();
+const AGENT_E164            = (process.env.AGENT_E164 || "972525555251").trim(); // agent number (no '+')
+const AGENT_TEMPLATE_NAME   = (process.env.AGENT_TEMPLATE_NAME || "agent_notify").trim(); // Utility template
 const AGENT_TEMPLATE_LANG   = (process.env.AGENT_TEMPLATE_LANG || "ar").trim();
 
 const BUSINESS_CATALOG_NUMBER = (process.env.BUSINESS_CATALOG_NUMBER || "972557215081").trim();
@@ -35,7 +35,7 @@ if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
 // ===== Utils & guards =====
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Dedup inbound messages to avoid retries double-processing
+// Dedup inbound messages (Meta retries)
 const processed = new Set();
 function alreadyProcessed(id) {
   if (!id) return false;
@@ -76,11 +76,11 @@ const pendingMenuByUser   = new Map(); // wa_id -> templateMessageId
 const menuSentForTemplate = new Set(); // templateMessageId
 
 // ===== Agent flow state =====
-// { step, service, name, message, attachments:[{mediaId}], wantPhotos }
+// { step, service, name, message }
 const agentFlow = new Map();
 
-// ===== Agent template open-window wait queue =====
-// templateMsgId -> { fromWaId, payloads: [ {kind:'text', body}, {kind:'image', mediaId, caption} ... ] }
+// ===== Agent template wait queue =====
+// templateMsgId -> { fromWaId, body }
 const pendingAgentSends = new Map();
 
 setInterval(() => {
@@ -88,7 +88,7 @@ setInterval(() => {
   for (const [k, ts] of welcomeCache) if (now - ts > WELCOME_TTL_MS) welcomeCache.delete(k);
   for (const [k, ts] of menuShownRecently) if (now - ts > 60*60*1000) menuShownRecently.delete(k);
   if (menuSentForTemplate.size > 10000) menuSentForTemplate.clear();
-  // Trim pending agent sends older than 10 minutes
+  // Trim agent queue older than 10 minutes
   for (const [k, v] of pendingAgentSends) if ((v.created || now) + 10*60*1000 < now) pendingAgentSends.delete(k);
 }, 60 * 1000);
 
@@ -102,41 +102,6 @@ async function waPost(payload) {
     },
     timeout: 20000,
   });
-}
-
-// Media helpers
-async function getMediaUrl(mediaId) {
-  const { data } = await axios.get(`https://graph.facebook.com/v23.0/${mediaId}`, {
-    headers: { Authorization: `Bearer ${WHATS_TOKEN}` },
-  });
-  return { url: data.url, mime_type: data.mime_type };
-}
-async function downloadMedia(url) {
-  const resp = await axios.get(url, {
-    headers: { Authorization: `Bearer ${WHATS_TOKEN}` },
-    responseType: "arraybuffer",
-    timeout: 30000,
-  });
-  return resp.data; // Buffer
-}
-async function uploadMediaToWA(buffer, mime_type, filename = "file") {
-  const form = new FormData();
-  form.append("messaging_product", "whatsapp");
-  form.append("file", buffer, { filename, contentType: mime_type });
-  form.append("type", mime_type);
-  const { data } = await axios.post(
-    `https://graph.facebook.com/v23.0/${PHONE_NUMBER_ID}/media`,
-    form,
-    {
-      headers: {
-        Authorization: `Bearer ${WHATS_TOKEN}`,
-        ...form.getHeaders(),
-      },
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-    }
-  );
-  return data.id;
 }
 
 // ===== Senders =====
@@ -219,6 +184,7 @@ async function sendCatalogLink(to) { await sendText(to, `🛍️ تفضّل ال
 function toLocal(waId) { return waId?.startsWith("972") ? "0" + waId.slice(3) : waId; }
 
 async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service, message }) {
+  // This template must be category = Utility and approved
   const template = {
     name: AGENT_TEMPLATE_NAME,
     language: { code: AGENT_TEMPLATE_LANG },
@@ -236,54 +202,49 @@ async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service
   return data?.messages?.[0]?.id;
 }
 
-// Queue messages to agent and send AFTER we get template status
-async function queueAgentMessagesFrom(waId, { name, service, message, attachments }) {
+async function queueAgentMessage(waId, { name, service, message }) {
   const local = toLocal(waId);
-
-  // 1) Open 24h window via template
+  // 1) Open 24h with template
   const tmplId = await sendAgentNotifyTemplate(AGENT_E164, {
-    name, localNumber: local, service, message
+    name, localNumber: local, service, message,
   });
 
-  // 2) Build queue (text + images)
-  const textBody =
-    `تفاصيل الطلب:\nالاسم: ${name}\nالرقم: ${local}\nالخدمة: ${service}\nالرسالة: ${message}`;
+  // 2) Prepare the follow-up text (to send after template status)
+  const body =
+    `تفاصيل الطلب:\n` +
+    `الاسم: ${name}\n` +
+    `الرقم: ${local}\n` +
+    `الخدمة: ${service}\n` +
+    `الرسالة: ${message}`;
 
   pendingAgentSends.set(tmplId, {
     fromWaId: waId,
     created: Date.now(),
-    payloads: [
-      { kind: "text", body: textBody },
-      ...(attachments || []).map((a) => ({ kind: "image", mediaId: a.mediaId, caption: `مرفق - ${name} / ${service}` }))
-    ],
+    body,
   });
 
-  // 3) Tell the customer
+  // 3) Tell the customer immediately
   await sendText(waId, "تم إرسال طلبك إلى فريق خدمة العملاء ✅\nسيتواصلون معك في أقرب وقت ممكن. شكرًا لتواصلك معنا.");
 }
 
-// Send everything in the queued payloads to agent (called when template status arrives)
 async function flushAgentQueueForTemplate(tmplId) {
   const job = pendingAgentSends.get(tmplId);
   if (!job) return;
-
-  for (const p of job.payloads) {
-    try {
-      if (p.kind === "text") {
-        await waPost({ messaging_product:"whatsapp", to: AGENT_E164, type:"text", text:{ body: p.body } });
-      } else if (p.kind === "image") {
-        const { url, mime_type } = await getMediaUrl(p.mediaId);
-        const bin = await downloadMedia(url);
-        const newId = await uploadMediaToWA(bin, mime_type, "attachment");
-        await waPost({ messaging_product:"whatsapp", to: AGENT_E164, type:"image", image:{ id: newId, caption: p.caption } });
-      }
-      await sleep(200);
-    } catch (e) {
-      console.error("❌ Sending to agent failed:", e?.response?.data || e);
-    }
+  try {
+    await waPost({ messaging_product:"whatsapp", to: AGENT_E164, type:"text", text:{ body: job.body } });
+  } catch (e) {
+    console.error("❌ Agent follow-up text failed:", e?.response?.data || e);
+  } finally {
+    pendingAgentSends.delete(tmplId);
   }
+}
 
-  pendingAgentSends.delete(tmplId);
+function backupLinkToAgent(waId, { name, service, message }) {
+  const local = toLocal(waId);
+  const txt = encodeURIComponent(
+    `طلب جديد\nالاسم: ${name}\nالرقم: ${local}\nالخدمة: ${service}\nالرسالة: ${message}`
+  );
+  return `https://wa.me/${AGENT_E164}?text=${txt}`;
 }
 
 // ===== Agent mini-flow (Option 4) =====
@@ -315,38 +276,21 @@ async function sendServiceMenu(waId) {
 }
 async function askFullName(waId) { await sendText(waId, "من فضلك اكتب اسمك الكامل:"); }
 async function askMessage(waId)  { await sendText(waId, "اكتب رسالتك بالتفصيل:"); }
-async function askIfWantsAttachments(waId) {
-  await waPost({
-    messaging_product: "whatsapp",
-    to: waId,
-    type: "interactive",
-    interactive: {
-      type: "button",
-      body: { text: "هل تريد إضافة صور مع الرسالة؟" },
-      action: { buttons: [
-        { type: "reply", reply: { id: "attach_yes", title: "نعم" } },
-        { type: "reply", reply: { id: "attach_no",  title: "لا" } },
-      ]},
-    },
-  });
-}
-async function askSendPhotosNow(waId) {
-  await sendText(waId, "أرسل حتى 3 صور الآن (واحدة تلو الأخرى). عند الانتهاء اكتب: تم");
-}
 
 async function startAgentFlow(waId) {
-  agentFlow.set(waId, { step: "choose_service", attachments: [] });
+  agentFlow.set(waId, { step: "choose_service" });
   await sendServiceMenu(waId);
 }
 async function handleServiceChoice(waId, idOrTitle) {
-  const st = agentFlow.get(waId) || { attachments: [] };
+  const st = agentFlow.get(waId) || {};
   const k = (idOrTitle || "").trim();
   if (k === "svc_repair" || k === "تصليح") st.service = "تصليح";
   else if (k === "svc_sell" || k === "بيع") st.service = "بيع";
   else if (k === "svc_buy" || k === "شراء") st.service = "شراء";
   else if (k === "svc_inquiry" || k === "استفسار") st.service = "استفسار";
-  else { await sendServiceMenu(waId); return; }
+  else { await sendServiceMenu(waId); return;
 
+  }
   st.step = "ask_name";
   agentFlow.set(waId, st);
   await askFullName(waId);
@@ -361,53 +305,20 @@ async function handleName(waId, text) {
 async function handleCustomerMessage(waId, text) {
   const st = agentFlow.get(waId); if (!st) return;
   st.message = text;
-  st.step = "attachments_confirm";
-  agentFlow.set(waId, st);
-  await askIfWantsAttachments(waId);
-}
-async function handleAttachmentsDecision(waId, choice) {
-  const st = agentFlow.get(waId); if (!st) return;
-  if (choice === "attach_yes" || choice === "نعم") {
-    st.wantPhotos = true;
-    st.step = "collecting_media";
-    agentFlow.set(waId, st);
-    await askSendPhotosNow(waId);
-  } else {
-    st.wantPhotos = false;
-    st.step = "forward";
-    agentFlow.set(waId, st);
-    await queueAgentMessagesFrom(waId, st);
+  // Queue to agent (template + wait)
+  try {
+    await queueAgentMessage(waId, st);
+  } catch (err) {
+    // Template send failed immediately (e.g., policy) — tell customer and give backup link
+    console.error("❌ Agent template send failed:", err?.response?.data || err);
+    const link = backupLinkToAgent(waId, st);
+    await sendText(
+      waId,
+      `تعذر إرسال الطلب تلقائيًا الآن. اضغط هذا الرابط لمراسلة فريق الخدمة مباشرةً:\n${link}`
+    );
+  } finally {
     resetAgentFlow(waId);
   }
-}
-async function handleIncomingImage(waId, imageObj) {
-  const st = agentFlow.get(waId);
-  if (!st || st.step !== "collecting_media") return false;
-  const mediaId = imageObj.id;
-  if (!mediaId) return true;
-
-  st.attachments = st.attachments || [];
-  if (st.attachments.length < 3) st.attachments.push({ mediaId });
-  agentFlow.set(waId, st);
-
-  if (st.attachments.length >= 3) {
-    await queueAgentMessagesFrom(waId, st);
-    resetAgentFlow(waId);
-  } else {
-    await sendText(waId, `تم استلام الصورة (${st.attachments.length}/3). يمكنك إرسال المزيد أو اكتب "تم".`);
-  }
-  return true;
-}
-async function maybeFinishOnDoneKeyword(waId, text) {
-  const st = agentFlow.get(waId);
-  if (!st || st.step !== "collecting_media") return false;
-  if (!text) return false;
-  if (/^(تم|خلص|انتهيت|done)$/i.test(text.trim())) {
-    await queueAgentMessagesFrom(waId, st);
-    resetAgentFlow(waId);
-    return true;
-  }
-  return false;
 }
 
 // ===== Main menu router =====
@@ -417,7 +328,7 @@ async function handleChoice(from, idOrTitle) {
   if (key === "open_catalog") {
     await sendCatalogLink(from);
   } else if (key === "browse_catalog") {
-    await sendCatalogLink(from); // extend later to deep-link set
+    await sendCatalogLink(from); // You can later deep-link a specific set
   } else if (key === "show_location" || key === "الموقع") {
     await sendLocation(from);
   } else if (key === "talk_agent" || key === "📞 خدمة العملاء") {
@@ -453,6 +364,7 @@ app.post("/", async (req, res) => {
             const waId   = st?.recipient_id;
             const msgId  = st?.id;
             const status = st?.status;
+            const error  = st?.errors?.[0];
 
             // Greeting -> Menu
             const pendingId = pendingMenuByUser.get(waId);
@@ -462,12 +374,30 @@ app.post("/", async (req, res) => {
               pendingMenuByUser.delete(waId);
             }
 
-            // Agent template: when 'sent' or 'delivered', flush queue
-            if ((status === "sent" || status === "delivered") && pendingAgentSends.has(msgId) && waId === AGENT_E164) {
-              await flushAgentQueueForTemplate(msgId);
+            // Agent template: on 'sent' or 'delivered' flush; on 'failed' offer backup
+            if (pendingAgentSends.has(msgId) && waId === AGENT_E164) {
+              if (status === "sent" || status === "delivered") {
+                await flushAgentQueueForTemplate(msgId);
+              } else if (status === "failed") {
+                const job = pendingAgentSends.get(msgId);
+                pendingAgentSends.delete(msgId);
+                // Tell the customer + provide manual link
+                if (job?.fromWaId) {
+                  await sendText(
+                    job.fromWaId,
+                    "تعذر إرسال الطلب تلقائيًا إلى فريق الخدمة الآن. سنحاول تحسين المسار.\n" +
+                    "يمكنك أيضًا مراسلتهم مباشرة عبر هذا الرابط:"
+                  );
+                  // Reconstruct link text from job.body
+                  const linkTxt = encodeURIComponent(job.body);
+                  const backup = `https://wa.me/${AGENT_E164}?text=${linkTxt}`;
+                  await sendText(job.fromWaId, backup);
+                }
+                console.error("❌ Agent template failed:", error || st);
+              }
             }
           }
-          continue;
+          return res.sendStatus(200);
         }
 
         // B) Inbound messages
@@ -476,33 +406,17 @@ app.post("/", async (req, res) => {
           const id   = msg.id;
           if (!from || alreadyProcessed(id)) continue;
 
-          // Agent media collecting
-          if (msg.type === "image" && msg.image?.id) {
-            const handled = await handleIncomingImage(from, msg.image);
-            if (handled) continue;
-          }
-
           const textBody = msg.text?.body?.trim();
 
-          // Collecting media: accept "تم"
-          if (await maybeFinishOnDoneKeyword(from, textBody)) continue;
-
           // Agent flow steps
-          const st = agentFlow.get(from);
-          if (st) {
-            if (msg.type === "interactive" && msg.interactive?.type === "list_reply" && st.step === "choose_service") {
+          const af = agentFlow.get(from);
+          if (af) {
+            if (msg.type === "interactive" && msg.interactive?.type === "list_reply" && af.step === "choose_service") {
               const { id, title } = msg.interactive.list_reply || {};
               await handleServiceChoice(from, id || title); continue;
             }
-            if (msg.type === "interactive" && msg.interactive?.type === "button_reply" && st.step === "attachments_confirm") {
-              const { id, title } = msg.interactive.button_reply || {};
-              await handleAttachmentsDecision(from, id || title); continue;
-            }
-            if (st.step === "ask_name" && textBody) { await handleName(from, textBody); continue; }
-            if (st.step === "message"  && textBody) { await handleCustomerMessage(from, textBody); continue; }
-            if (st.step === "collecting_media" && textBody) {
-              await sendText(from, 'أرسل حتى 3 صور، أو اكتب "تم" عند الانتهاء.'); continue;
-            }
+            if (af.step === "ask_name" && textBody) { await handleName(from, textBody); continue; }
+            if (af.step === "message"  && textBody) { await handleCustomerMessage(from, textBody); continue; }
           }
 
           // Location keywords
@@ -531,6 +445,8 @@ app.post("/", async (req, res) => {
             }
           }
         }
+
+        return res.sendStatus(200);
       }
     }
 
