@@ -262,8 +262,19 @@ async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service
 async function ensureAgentWindowOpen(context, options = {}) {
   const force = Boolean(options.force);
   if (!force && isAgentWindowOpen()) return;
-  await sendAgentNotifyTemplate(AGENT_E164, context);
-  await sleep(600);
+  try {
+    await sendAgentNotifyTemplate(AGENT_E164, context);
+  } catch (e) {
+    const err = e?.response?.data?.error || {};
+    const code = err.code;
+    if (code === 131049) {
+      await sleep(2000);
+      await sendAgentNotifyTemplate(AGENT_E164, context);
+    } else {
+      throw e;
+    }
+  }
+  await sleep(2000);
 }
 
 // NOTE: removed deep-linking to customer per your request.
@@ -281,7 +292,7 @@ async function safeSendToAgent(payload, openContext) {
     // 24h window closed => open with template and retry
     if (code === 131047 || /re-engagement/i.test(details)) {
       await ensureAgentWindowOpen(openContext, { force: true });
-      await sleep(800);
+      await sleep(2000);
       const resp2 = await waPost(payload);
       return resp2?.data?.messages?.[0]?.id || null;
     }
@@ -512,7 +523,7 @@ app.post("/", async (req, res) => {
                   if (attempts < 2) {
                     try {
                       await ensureAgentWindowOpen(context, { force: true });
-                      await sleep(800);
+                      await sleep(2000);
                       const resp = await waPost(payload);
                       const newId = resp?.data?.messages?.[0]?.id || null;
                       if (newId) {
