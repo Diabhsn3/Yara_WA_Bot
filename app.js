@@ -252,16 +252,33 @@ async function queueAgentMessagesFrom(waId, { name, service, message }) {
   pendingAgentSends.set(tmplId, {
     fromWaId: waId,
     created: Date.now(),
+    flushed: false,
     payloads: [
       { kind: "text", body: textBody }
     ],
   });
+  console.log(`↪️ Queued agent forward under template ${tmplId} for ${AGENT_E164}`);
+
+  // 3) Fallback: if no status arrives in ~6s, flush anyway
+  setTimeout(async () => {
+    const job = pendingAgentSends.get(tmplId);
+    if (job && !job.flushed) {
+      console.log(`⏱️ Fallback flush for template ${tmplId}`);
+      try { await flushAgentQueueForTemplate(tmplId); } catch (e) {
+        console.error("❌ Fallback flush error:", e?.response?.data || e);
+      }
+    }
+  }, 6000);
 }
 
 // Send everything in the queued payloads to agent (called when template status arrives)
 async function flushAgentQueueForTemplate(tmplId) {
   const job = pendingAgentSends.get(tmplId);
   if (!job) return;
+  if (job.flushed) return;
+  job.flushed = true;
+  pendingAgentSends.set(tmplId, job);
+  console.log(`🚚 Flushing agent queue for template ${tmplId} (${job.payloads.length} items)`);
 
   for (const p of job.payloads) {
     try {
