@@ -185,24 +185,40 @@ async function sendMenu(to) {
     type: "interactive",
     interactive: {
       type: "list",
-      header: { type: "text", text: "💎 تفضّل باختيار ما يناسبك 💎" },
+      header: { type: "text", text: "💎 تفضّل باختيار ما يناسبك 💎" }, // ≤ 60
       body:   { text: "نقدّم لك هذه الخيارات لتسهيل تواصلك معنا:" },
       footer: { text: "شكراً لاختيارك مجوهرات يارا" },
       action: {
-        button: "عرض الخدمات",
+        button: "عرض الخدمات", // ≤ 20
         sections: [
           {
-            title: "القائمة",
+            title: "القائمة", // ≤ 24
             rows: [
-              { id: "show_catalog_new", title: "🛍️ الكاتالوج — جديد", description: "تشكيلات جديدة" },
-              { id: "show_catalog_best", title: "⭐ الكاتالوج — الأكثر طلبًا", description: "مختارات مميزة" },
-              { id: "show_location",  title: "📍 موقعنا (اللوكيشن)", description: "استلم موقعنا كلوكيشن" },
-              { id: "talk_agent",     title: "📞 خدمة العملاء",    description: "تواصل مباشر مع ممثلنا" },
-            ],
-          },
-        ],
-      },
-    },
+              {
+                id: "open_catalog",
+                title: "عرض الكتالوج", // ≤ 24
+                description: "استعراض جميع المنتجات" // ≤ 72
+              },
+              {
+                id: "browse_catalog",
+                title: "تصفح حسب الفئة", // ≤ 24
+                description: "اختيار مجموعة/فئة من الكتالوج"
+              },
+              {
+                id: "show_location",
+                title: "📍 الموقع", // ≤ 24
+                description: "إرسال اللوكيشن وساعات العمل"
+              },
+              {
+                id: "talk_agent",
+                title: "📞 خدمة العملاء", // ≤ 24
+                description: "تواصل مع ممثل الخدمة"
+              }
+            ]
+          }
+        ]
+      }
+    }
   });
 }
 
