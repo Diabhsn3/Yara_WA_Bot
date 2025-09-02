@@ -259,8 +259,9 @@ async function sendAgentNotifyTemplate(toAgentE164, { name, localNumber, service
   markAgentWindowOpen();
 }
 
-async function ensureAgentWindowOpen(context) {
-  if (isAgentWindowOpen()) return;
+async function ensureAgentWindowOpen(context, options = {}) {
+  const force = Boolean(options.force);
+  if (!force && isAgentWindowOpen()) return;
   await sendAgentNotifyTemplate(AGENT_E164, context);
   await sleep(600);
 }
@@ -279,7 +280,7 @@ async function safeSendToAgent(payload, openContext) {
 
     // 24h window closed => open with template and retry
     if (code === 131047 || /re-engagement/i.test(details)) {
-      await ensureAgentWindowOpen(openContext);
+      await ensureAgentWindowOpen(openContext, { force: true });
       await sleep(800);
       const resp2 = await waPost(payload);
       return resp2?.data?.messages?.[0]?.id || null;
@@ -510,7 +511,7 @@ app.post("/", async (req, res) => {
                   const { payload, context, attempts } = agentPending;
                   if (attempts < 2) {
                     try {
-                      await ensureAgentWindowOpen(context);
+                      await ensureAgentWindowOpen(context, { force: true });
                       await sleep(800);
                       const resp = await waPost(payload);
                       const newId = resp?.data?.messages?.[0]?.id || null;
@@ -524,6 +525,29 @@ app.post("/", async (req, res) => {
                       }
                     } catch (e) {
                       console.error("❌ Agent resend failed:", e?.response?.data || e);
+                    } finally {
+                      pendingAgentSends.delete(msgId);
+                    }
+                  } else {
+                    pendingAgentSends.delete(msgId);
+                  }
+                } else if (code === 131049) { // Healthy ecosystem throttle
+                  const { payload, context, attempts } = agentPending;
+                  if (attempts < 2) {
+                    try {
+                      await sleep(1500);
+                      const resp = await waPost(payload);
+                      const newId = resp?.data?.messages?.[0]?.id || null;
+                      if (newId) {
+                        pendingAgentSends.set(newId, {
+                          payload,
+                          context,
+                          attempts: attempts + 1,
+                          ts: Date.now(),
+                        });
+                      }
+                    } catch (e) {
+                      console.error("❌ Agent resend (131049) failed:", e?.response?.data || e);
                     } finally {
                       pendingAgentSends.delete(msgId);
                     }
