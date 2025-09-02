@@ -3,8 +3,9 @@
 // - Menu (interactive list) sent once after template 'sent' status
 // - If user types free text instead of choosing: prompt + menu (cooldown)
 // - Location pin + hours
-// - Agent handoff via wa.me prefilled link with service + name + message
-// - Catalog options in menu (+ catalog keyword support)
+// - Agent handoff via DIRECT FORWARD to AGENT_E164 (no wa.me link)
+// - Collect service → name → message; include local phone (0xxxxxxxxx) in forward
+// - Catalog deep link
 
 const express = require("express");
 const axios = require("axios");
@@ -25,7 +26,13 @@ const TEMPLATE_HEADER_IMAGE_URL =
 const TEMPLATE_HEADER_MEDIA_ID =
   (process.env.TEMPLATE_HEADER_MEDIA_ID || "").trim();            // media id if uploaded
 
-const AGENT_E164 = (process.env.AGENT_E164 || "972525555251").trim(); // agent number (E.164, no +)
+// Agent number to receive forwarded requests (E.164 without '+')
+const AGENT_E164 = (process.env.AGENT_E164 || "972525555251").trim();
+
+// Optional: a template to force-open the 24h window when forwarding to the agent fails.
+// Must be pre-approved and have 3 body params: name, local phone, message summary.
+// const FORWARD_TEMPLATE = process.env.FORWARD_TEMPLATE || "forward_to_agent";
+// const FORWARD_TEMPLATE_LANG = process.env.FORWARD_TEMPLATE_LANG || "ar";
 
 // Catalog deep link (WhatsApp catalog)
 const CATALOG_PHONE_E164 = (process.env.CATALOG_PHONE_E164 || "972557215081").trim();
@@ -91,10 +98,7 @@ function shouldSendWelcome(waId) {
  * }
  */
 const agentFlow = new Map(); // wa_id -> state object
-
-function resetAgentFlow(waId) {
-  agentFlow.delete(waId);
-}
+function resetAgentFlow(waId) { agentFlow.delete(waId); }
 
 // Greeting→Menu ordering state
 const pendingMenuByUser   = new Map(); // wa_id -> templateMessageId (wait for status)
@@ -178,8 +182,8 @@ async function sendMenu(to) {
             rows: [
               { id: "show_catalog",      title: "🛍️ عرض الكتالوج",      description: "تصفّح كل المنتجات والصور" },
               { id: "catalog_help",      title: "🧭 مساعدة في الكتالوج", description: "اكتب اسم الصنف لنرشدك" },
-              { id: "show_location",     title: "📍 موقعنا (اللوكيشن)", description: "استلم موقعنا كلوكيشن" },
-              { id: "talk_agent",        title: "📞 خدمة العملاء",      description: "تواصل مباشر مع ممثلنا" },
+              { id: "show_location",     title: "📍 موقعنا (اللوكيشن)",  description: "استلم موقعنا كلوكيشن" },
+              { id: "talk_agent",        title: "📞 خدمة العملاء",       description: "تواصل مباشر مع ممثلنا" },
             ],
           },
         ],
@@ -216,20 +220,67 @@ async function sendLocation(to) {
   );
 }
 
-// ===== Agent handoff =====
-// Build in the exact format requested:
-//
-// مرحبا معك "<name>"
-// الخدمة "<service>"
-// الرسالة "<message>"
-function buildAgentLink({ name, service, message }) {
-  const text =
-    `مرحبا معك "${name}"\n` +
-    `الخدمة "${service}"\n` +
-    `الرسالة "${message}"`;
+// ===== DIRECT forward to agent =====
+function toLocal0(waId) {
+  // Convert E.164 "972xxxxxxxxx" to "0xxxxxxxxx"
+  if (!waId) return "";
+  if (waId.startsWith("972")) return "0" + waId.slice(3);
+  return waId;
+}
 
-  const encoded = encodeURIComponent(text);
-  return `https://wa.me/${AGENT_E164}?text=${encoded}`;
+// Try to send a text directly to the agent from your business number.
+// If it fails with a 24h-window error (e.g., 470/131045), we currently inform the user.
+// (Optional) You can implement a template fallback here if you create FORWARD_TEMPLATE.
+async function forwardToAgent({ name, service, message, fromWaId }) {
+  const local = toLocal0(fromWaId);
+  const composed =
+    `طلب جديد من بوت يارا:\n` +
+    `الاسم: ${name}\n` +
+    `الرقم: ${local}\n` +
+    `الخدمة: ${service}\n` +
+    `الرسالة: ${message}\n` +
+    `معرّف واتساب: ${fromWaId}`;
+
+  try {
+    await waPost({
+      messaging_product: "whatsapp",
+      to: AGENT_E164,
+      type: "text",
+      text: { body: composed },
+    });
+    return { ok: true };
+  } catch (err) {
+    const data = err?.response?.data;
+    console.error("❌ forwardToAgent error:", data || err);
+
+    // // OPTIONAL TEMPLATE FALLBACK (uncomment after you create/approve a template)
+    // if (FORWARD_TEMPLATE && (data?.error?.code === 470 || data?.error?.code === 131045)) {
+    //   try {
+    //     await waPost({
+    //       messaging_product: "whatsapp",
+    //       to: AGENT_E164,
+    //       type: "template",
+    //       template: {
+    //         name: FORWARD_TEMPLATE,
+    //         language: { code: FORWARD_TEMPLATE_LANG },
+    //         components: [{
+    //           type: "body",
+    //           parameters: [
+    //             { type: "text", text: name },
+    //             { type: "text", text: local },
+    //             { type: "text", text: `${service}: ${message}` },
+    //           ],
+    //         }],
+    //       },
+    //     });
+    //     return { ok: true };
+    //   } catch (e2) {
+    //     console.error("❌ forwardToAgent template fallback error:", e2?.response?.data || e2);
+    //   }
+    // }
+
+    return { ok: false, reason: data || err };
+  }
 }
 
 // Send the service submenu (تصليح، بيع، شراء، استفسار)
@@ -284,7 +335,6 @@ async function askForMessage(to) {
 async function finishAgentFlow(to, userMessage) {
   const st = agentFlow.get(to);
   if (!st || st.step !== "message" || !st.name || !st.service) {
-    // State missing — reset gracefully
     resetAgentFlow(to);
     await sendText(to, "حدث خطأ بسيط في جمع البيانات. لنحاول من جديد.");
     await sendServiceMenu(to);
@@ -292,18 +342,27 @@ async function finishAgentFlow(to, userMessage) {
   }
   st.message = userMessage;
 
-  const link = buildAgentLink({
+  // Forward directly to agent
+  const result = await forwardToAgent({
     name: st.name,
     service: st.service,
     message: st.message,
+    fromWaId: to,
   });
 
   resetAgentFlow(to);
 
-  await sendText(
-    to,
-    `تم تجهيز الرسالة 👌\nاضغط على الرابط لبدء محادثة مباشرة مع ممثل الخدمة، وسيظهر كل شيء مهيّأ للإرسال:\n${link}`
-  );
+  if (result.ok) {
+    await sendText(
+      to,
+      "تم إرسال رسالتك إلى فريق خدمة العملاء ✅\nسيتواصلون معك في أقرب وقت ممكن. شكرًا لتواصلك معنا."
+    );
+  } else {
+    await sendText(
+      to,
+      "تعذر إرسال رسالتك إلى فريق الخدمة في الوقت الحالي. يرجى المحاولة مجددًا لاحقًا أو اختيار خدمة أخرى من القائمة."
+    );
+  }
 }
 
 // ===== Choice router =====
