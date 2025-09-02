@@ -127,7 +127,14 @@ async function uploadMediaToWA(buffer, mime_type, filename = "file") {
   const { data } = await axios.post(
     `https://graph.facebook.com/v23.0/${PHONE_NUMBER_ID}/media`,
     form,
-    { headers: { Authorization: `Bearer ${WHATS_TOKEN}", ...form.getHeaders() } }
+    {
+      headers: {
+        Authorization: `Bearer ${WHATS_TOKEN}`,
+        ...form.getHeaders(),
+      },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    }
   );
   return data.id;
 }
@@ -181,7 +188,7 @@ async function sendMenu(to) {
 }
 
 async function sendMenuWithPrompt(to) {
-  await sendText(to, "لفهم طلبك بسرعة، اختر من القائمة أدناه 👇 أو اكتب \"الموقع\" للحصول على اللوكيشن.");
+  await sendText(to, 'لفهم طلبك بسرعة، اختر من القائمة أدناه 👇 أو اكتب "الموقع" للحصول على اللوكيشن.');
   await sendMenu(to);
 }
 
@@ -197,16 +204,16 @@ async function sendLocation(to) {
       address: "طمرة، شارع ابن زيدون",
     },
   });
-  await sendText(to, `⏰ ساعات العمل:\n• السبت – الخميس: 12:00 ظهرًا – 21:00 مساءً\n• الجمعة: 15:00 ظهرًا – 21:00 مساءً`);
+  const hours =
+    "⏰ ساعات العمل:\n" +
+    "• السبت – الخميس: 12:00 ظهرًا – 21:00 مساءً\n" +
+    "• الجمعة: 15:00 ظهرًا – 21:00 مساءً";
+  await sendText(to, hours);
 }
 
 // Catalog link
-function catalogLink() {
-  return `https://wa.me/c/${BUSINESS_CATALOG_NUMBER}`;
-}
-async function sendCatalogLink(to) {
-  await sendText(to, `🛍️ تفضّل الكتالوج:\n${catalogLink()}`);
-}
+function catalogLink() { return `https://wa.me/c/${BUSINESS_CATALOG_NUMBER}`; }
+async function sendCatalogLink(to) { await sendText(to, `🛍️ تفضّل الكتالوج:\n${catalogLink()}`); }
 
 // ===== Agent handoff =====
 function toLocal(waId) { return waId?.startsWith("972") ? "0" + waId.slice(3) : waId; }
@@ -270,7 +277,7 @@ async function flushAgentQueueForTemplate(tmplId) {
         const newId = await uploadMediaToWA(bin, mime_type, "attachment");
         await waPost({ messaging_product:"whatsapp", to: AGENT_E164, type:"image", image:{ id: newId, caption: p.caption } });
       }
-      await sleep(200); // small spacing
+      await sleep(200);
     } catch (e) {
       console.error("❌ Sending to agent failed:", e?.response?.data || e);
     }
@@ -410,7 +417,7 @@ async function handleChoice(from, idOrTitle) {
   if (key === "open_catalog") {
     await sendCatalogLink(from);
   } else if (key === "browse_catalog") {
-    await sendCatalogLink(from); // (Can be extended to deep-link a specific set)
+    await sendCatalogLink(from); // extend later to deep-link set
   } else if (key === "show_location" || key === "الموقع") {
     await sendLocation(from);
   } else if (key === "talk_agent" || key === "📞 خدمة العملاء") {
@@ -455,7 +462,7 @@ app.post("/", async (req, res) => {
               pendingMenuByUser.delete(waId);
             }
 
-            // Agent template open-window: when the template to AGENT is 'sent' or 'delivered', flush queue
+            // Agent template: when 'sent' or 'delivered', flush queue
             if ((status === "sent" || status === "delivered") && pendingAgentSends.has(msgId) && waId === AGENT_E164) {
               await flushAgentQueueForTemplate(msgId);
             }
@@ -494,7 +501,7 @@ app.post("/", async (req, res) => {
             if (st.step === "ask_name" && textBody) { await handleName(from, textBody); continue; }
             if (st.step === "message"  && textBody) { await handleCustomerMessage(from, textBody); continue; }
             if (st.step === "collecting_media" && textBody) {
-              await sendText(from, "أرسل حتى 3 صور، أو اكتب \"تم\" عند الانتهاء."); continue;
+              await sendText(from, 'أرسل حتى 3 صور، أو اكتب "تم" عند الانتهاء.'); continue;
             }
           }
 
