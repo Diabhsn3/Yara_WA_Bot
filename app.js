@@ -1,9 +1,10 @@
 // app.js — Yara WhatsApp: ordered greeting ➜ single menu (no spam)
 // - Greeting template (optionally with header image), once/24h
-// - Menu (interactive list) sent exactly once after template 'sent' status
+// - Menu (interactive list) sent once after template 'sent' status
 // - If user types free text instead of choosing: prompt + menu (cooldown)
 // - Location pin + hours
-// - Agent handoff via wa.me prefilled link
+// - Agent handoff via wa.me prefilled link with service + name + message
+// - Catalog options in menu (+ catalog keyword support)
 
 const express = require("express");
 const axios = require("axios");
@@ -24,7 +25,11 @@ const TEMPLATE_HEADER_IMAGE_URL =
 const TEMPLATE_HEADER_MEDIA_ID =
   (process.env.TEMPLATE_HEADER_MEDIA_ID || "").trim();            // media id if uploaded
 
-const AGENT_E164 = process.env.AGENT_E164 || "972525555251";      // agent number (E.164, no +)
+const AGENT_E164 = (process.env.AGENT_E164 || "972525555251").trim(); // agent number (E.164, no +)
+
+// Catalog deep link (WhatsApp catalog)
+const CATALOG_PHONE_E164 = (process.env.CATALOG_PHONE_E164 || "972557215081").trim();
+const CATALOG_LINK = `https://wa.me/c/${CATALOG_PHONE_E164}`;
 
 if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
   console.error("❌ Missing WHATS_TOKEN or PHONE_NUMBER_ID env vars.");
@@ -76,8 +81,20 @@ function shouldSendWelcome(waId) {
   return false;
 }
 
-// Agent handoff state
-const awaitingQuestion = new Map(); // wa_id -> true
+// ====== Agent flow state (service → name → message) ======
+/**
+ * agentFlow per user:
+ * {
+ *   step: 'service' | 'name' | 'message',
+ *   service?: 'تصليح'|'بيع'|'شراء'|'استفسار',
+ *   name?: string
+ * }
+ */
+const agentFlow = new Map(); // wa_id -> state object
+
+function resetAgentFlow(waId) {
+  agentFlow.delete(waId);
+}
 
 // Greeting→Menu ordering state
 const pendingMenuByUser   = new Map(); // wa_id -> templateMessageId (wait for status)
@@ -142,6 +159,7 @@ async function sendText(to, body) {
   });
 }
 
+// ===== Main menu (with catalog) =====
 async function sendMenu(to) {
   await waPost({
     messaging_product: "whatsapp",
@@ -158,10 +176,10 @@ async function sendMenu(to) {
           {
             title: "القائمة",
             rows: [
-              { id: "show_products",  title: "عرض التشكيلة",     description: "خواتم • أطقم • سلاسل" },
-              { id: "show_pricing",   title: "الأسعار والعروض",   description: "خصومات ومجموعات خاصة" },
-              { id: "show_location",  title: "📍 موقعنا (اللوكيشن)", description: "استلم موقعنا كلوكيشن" },
-              { id: "talk_agent",     title: "📞 خدمة العملاء",    description: "تواصل مباشر مع ممثلنا" },
+              { id: "show_catalog",      title: "🛍️ عرض الكتالوج",      description: "تصفّح كل المنتجات والصور" },
+              { id: "catalog_help",      title: "🧭 مساعدة في الكتالوج", description: "اكتب اسم الصنف لنرشدك" },
+              { id: "show_location",     title: "📍 موقعنا (اللوكيشن)", description: "استلم موقعنا كلوكيشن" },
+              { id: "talk_agent",        title: "📞 خدمة العملاء",      description: "تواصل مباشر مع ممثلنا" },
             ],
           },
         ],
@@ -173,7 +191,7 @@ async function sendMenu(to) {
 async function sendMenuWithPrompt(to) {
   await sendText(
     to,
-    "لفهم طلبك بسرعة، اختر من القائمة أدناه 👇 أو اكتب \"الموقع\" للحصول على اللوكيشن."
+    "لفهم طلبك بسرعة، اختر من القائمة أدناه 👇 أو اكتب \"الموقع\" للحصول على اللوكيشن. لعرض المنتجات اكتب \"كتالوج\"."
   );
   await sendMenu(to);
 }
@@ -199,27 +217,92 @@ async function sendLocation(to) {
 }
 
 // ===== Agent handoff =====
-function buildAgentLink(question, waId) {
-  const local = waId?.startsWith("972") ? "0" + waId.slice(3) : waId;
-  const msg = `لقد وصلتك رسالة من "${local}" والرسالة هي:\n${question}`;
-  const encoded = encodeURIComponent(msg);
+// Build in the exact format requested:
+//
+// مرحبا معك "<name>"
+// الخدمة "<service>"
+// الرسالة "<message>"
+function buildAgentLink({ name, service, message }) {
+  const text =
+    `مرحبا معك "${name}"\n` +
+    `الخدمة "${service}"\n` +
+    `الرسالة "${message}"`;
+
+  const encoded = encodeURIComponent(text);
   return `https://wa.me/${AGENT_E164}?text=${encoded}`;
 }
 
-async function startAgentFlow(from) {
-  awaitingQuestion.set(from, true);
+// Send the service submenu (تصليح، بيع، شراء، استفسار)
+async function sendServiceMenu(to) {
+  agentFlow.set(to, { step: "service" });
+  await waPost({
+    messaging_product: "whatsapp",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "list",
+      header: { type: "text", text: "📞 خدمة العملاء" },
+      body:   { text: "اختر الخدمة التي تريد الاستفسار عنها:" },
+      footer: { text: "يرجى اختيار خيار واحد" },
+      action: {
+        button: "اختيار الخدمة",
+        sections: [
+          {
+            title: "الخدمات",
+            rows: [
+              { id: "svc_repair", title: "تصليح" },
+              { id: "svc_sell",   title: "بيع" },
+              { id: "svc_buy",    title: "شراء" },
+              { id: "svc_info",   title: "استفسار" },
+            ],
+          },
+        ],
+      },
+    },
+  });
+}
+
+async function askForName(to, serviceTitle) {
+  agentFlow.set(to, { step: "name", service: serviceTitle });
   await sendText(
-    from,
-    "لخدمتِك بشكل أسرع، من فضلك اكتب باختصار سؤالك أو ما تريد الاستفسار عنه، ثم سنرسل لك رابط محادثة مباشرة مع ممثل الخدمة."
+    to,
+    `ممتاز، اخترت خدمة "${serviceTitle}".\nمن فضلك اكتب اسمك الكامل:`
   );
 }
 
-async function finishAgentFlow(from, userText) {
-  awaitingQuestion.delete(from);
-  const link = buildAgentLink(userText, from);
+async function askForMessage(to) {
+  const st = agentFlow.get(to);
+  if (!st) return;
+  st.step = "message";
+  agentFlow.set(to, st);
   await sendText(
-    from,
-    `شكرًا لك! اضغط على الرابط لبدء محادثة مباشرة مع ممثل الخدمة (سيظهر سؤالك مهيّأً للإرسال):\n${link}`
+    to,
+    "شكرًا لك.\nالآن اكتب الرسالة / سؤالك بالتفصيل لكي نرسلها لممثل خدمة العملاء:"
+  );
+}
+
+async function finishAgentFlow(to, userMessage) {
+  const st = agentFlow.get(to);
+  if (!st || st.step !== "message" || !st.name || !st.service) {
+    // State missing — reset gracefully
+    resetAgentFlow(to);
+    await sendText(to, "حدث خطأ بسيط في جمع البيانات. لنحاول من جديد.");
+    await sendServiceMenu(to);
+    return;
+  }
+  st.message = userMessage;
+
+  const link = buildAgentLink({
+    name: st.name,
+    service: st.service,
+    message: st.message,
+  });
+
+  resetAgentFlow(to);
+
+  await sendText(
+    to,
+    `تم تجهيز الرسالة 👌\nاضغط على الرابط لبدء محادثة مباشرة مع ممثل الخدمة، وسيظهر كل شيء مهيّأ للإرسال:\n${link}`
   );
 }
 
@@ -227,20 +310,50 @@ async function finishAgentFlow(from, userText) {
 async function handleChoice(from, idOrTitle) {
   const key = (idOrTitle || "").trim();
 
-  if (key === "عرض التشكيلة" || key === "show_products") {
-    await sendText(from, "تفضّل تشكيلة مجوهرات يارا: https://your-site/collection");
-  } else if (key === "الأسعار والعروض" || key === "show_pricing") {
-    await sendText(from, "الأسعار والعروض الحالية: https://your-site/pricing");
-  } else if (key === "الموقع" || key === "show_location") {
+  // Catalog
+  if (key === "show_catalog" || key === "🛍️ عرض الكتالوج") {
+    await sendText(
+      from,
+      `تفضّل كتالوج يارا الكامل:\n${CATALOG_LINK}\n\nيمكنك إضافة المنتجات إلى السلة أو إرسال استفسارك لنا هنا.`
+    );
+    return;
+  }
+  if (key === "catalog_help" || key === "🧭 مساعدة في الكتالوج") {
+    await sendText(
+      from,
+      "اكتب اسم الصنف الذي تبحث عنه (مثل: خاتم، طقم خطوبة، حلق 21) وسنرسل لك روابط مباشرة من الكتالوج."
+    );
+    return;
+  }
+
+  // Location
+  if (key === "الموقع" || key === "show_location") {
     await sendLocation(from);
-  } else if (key === "تواصل مع ممثل خدمة العملاء" || key === "talk_agent" || key === "📞 خدمة العملاء") {
-    await startAgentFlow(from);
-  } else {
-    // Unknown option → polite prompt + menu
-    if (canShowMenu(from)) {
-      await sendMenuWithPrompt(from);
-      markMenuShown(from);
-    }
+    return;
+  }
+
+  // Agent: start multi-step flow
+  if (key === "تواصل مع ممثل خدمة العملاء" || key === "talk_agent" || key === "📞 خدمة العملاء") {
+    await sendServiceMenu(from);
+    return;
+  }
+
+  // Service submenu selections
+  if (["svc_repair", "svc_sell", "svc_buy", "svc_info"].includes(key)) {
+    const titleMap = {
+      svc_repair: "تصليح",
+      svc_sell:   "بيع",
+      svc_buy:    "شراء",
+      svc_info:   "استفسار",
+    };
+    await askForName(from, titleMap[key]);
+    return;
+  }
+
+  // Unknown option → polite prompt + menu
+  if (canShowMenu(from)) {
+    await sendMenuWithPrompt(from);
+    markMenuShown(from);
   }
 }
 
@@ -295,10 +408,19 @@ app.post("/", async (req, res) => {
 
           const textBody = msg.text?.body?.trim();
 
-          // Agent handoff capture
-          if (awaitingQuestion.get(from) && textBody) {
-            await finishAgentFlow(from, textBody);
-            continue;
+          // If the user is in the agent flow wizard, collect inputs
+          const st = agentFlow.get(from);
+          if (st && textBody) {
+            if (st.step === "name") {
+              st.name = textBody;
+              agentFlow.set(from, st);
+              await askForMessage(from);
+              continue;
+            }
+            if (st.step === "message") {
+              await finishAgentFlow(from, textBody);
+              continue;
+            }
           }
 
           // Location keywords immediately
@@ -307,7 +429,13 @@ app.post("/", async (req, res) => {
             continue;
           }
 
-          // Interactive replies
+          // Catalog keyword shortcut
+          if (textBody && /(كتالوج|catalog)/i.test(textBody)) {
+            await sendText(from, `هذا هو كتالوج يارا:\n${CATALOG_LINK}`);
+            continue;
+          }
+
+          // Interactive replies (main menu or service submenu)
           if (msg.type === "interactive") {
             if (msg.interactive?.type === "button_reply") {
               const { id, title } = msg.interactive.button_reply || {};
