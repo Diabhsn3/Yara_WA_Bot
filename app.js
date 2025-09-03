@@ -339,6 +339,19 @@ app.post("/", async (req, res) => {
 
           const textBody = msg.text?.body?.trim();
 
+          // If user sends an image/photo, inform them about the limitation and guide to customer service
+          if (msg.type === "image" || msg.image) {
+            await sendText(
+              from,
+              "عذرًا، لا يمكننا عرض الصور المرسلة هنا تلقائيًا.\n" +
+              "لإرسال صورك يُرجى التواصل مع خدمة العملاء.\n" +
+              "بعد أن يتواصل معك ممثلنا ستتمكن من إرسال الصور لهم مباشرة.\n" +
+              "اختر من القائمة: 📞 خدمة العملاء"
+            );
+            if (canShowMenu(from)) { await sendMenuWithPrompt(from); markMenuShown(from); }
+            continue;
+          }
+
           // Agent flow steps
           const st = agentFlow.get(from);
           if (st) {
@@ -365,15 +378,16 @@ app.post("/", async (req, res) => {
             }
           }
 
-          // Free text not in a flow → greeting+menu or prompt+menu
+          // Free text not in a flow → always send instruction + show menu
           if (textBody) {
-            if (shouldSendWelcome(from)) {
-              const templateMsgId = await sendTemplate(from);
-              if (templateMsgId) pendingMenuByUser.set(from, templateMsgId);
-              else if (canShowMenu(from)) { await sendMenu(from); markMenuShown(from); }
-            } else {
-              if (canShowMenu(from)) { await sendMenuWithPrompt(from); markMenuShown(from); }
-            }
+            await sendText(
+              from,
+              "من فضلك، هنا يتم الاختيار من القائمة فقط.\n" +
+              "للتواصل المباشر مع ممثلينا اختر من القائمة: \"📞 خدمة العملاء\".\n" +
+              "بعد بدء المحادثة مع خدمة العملاء ستتمكن من إرسال التفاصيل هناك."
+            );
+            if (canShowMenu(from)) { await sendMenuWithPrompt(from); markMenuShown(from); }
+            continue;
           }
         }
       }
