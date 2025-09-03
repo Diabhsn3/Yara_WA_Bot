@@ -281,8 +281,10 @@ async function handleChoice(from, idOrTitle) {
 
   if (key === "open_catalog") {
     await sendCatalogLink(from);
+    await sendText(from, "⚠️ ملاحظة مهمة: هذا الكتالوج ليس النهائي وهو قيد التطوير والتحديث المستمر. شكراً لتفهمكم! 🚧");
   } else if (key === "browse_catalog") {
     await sendCatalogLink(from); // extend later to deep-link set
+    await sendText(from, "⚠️ ملاحظة مهمة: هذا الكتالوج ليس النهائي وهو قيد التطوير والتحديث المستمر. شكراً لتفهمكم! 🚧");
   } else if (key === "show_location" || key === "الموقع") {
     await sendLocation(from);
   } else if (key === "talk_agent" || key === "📞 خدمة العملاء") {
@@ -383,6 +385,9 @@ app.post("/", async (req, res) => {
     res.sendStatus(200);
   }
 });
+
+
+
 
 // Health
 app.get("/health", (_req, res) => res.send("OK"));
