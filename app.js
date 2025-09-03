@@ -251,6 +251,13 @@ async function handleCustomerMessage(waId, text) {
   const st = agentFlow.get(waId); if (!st) return;
   st.message = text;
 
+  // Clean message text for WhatsApp template (remove newlines, tabs, excessive spaces)
+  const cleanMessage = text
+    .replace(/\n/g, ' ')           // Replace newlines with spaces
+    .replace(/\t/g, ' ')           // Replace tabs with spaces
+    .replace(/\s{5,}/g, ' ')       // Replace 5+ consecutive spaces with single space
+    .trim();                       // Remove leading/trailing spaces
+
   // Send ONLY the template to the agent
   const local = toLocal(waId);
   try {
@@ -258,7 +265,7 @@ async function handleCustomerMessage(waId, text) {
       name: st.name,
       localNumber: local,
       service: st.service,
-      message: st.message,
+      message: cleanMessage,
     });
   } catch (e) {
     console.error("❌ Agent template send failed:", e?.response?.data || e);
@@ -378,15 +385,30 @@ app.post("/", async (req, res) => {
             }
           }
 
-          // Free text not in a flow → always send instruction + show menu
+          // Free text not in a flow → first in 24h: greeting template; otherwise instruction + menu
           if (textBody) {
-            await sendText(
-              from,
-              "من فضلك، هنا يتم الاختيار من القائمة فقط.\n" +
-              "للتواصل المباشر مع ممثلينا اختر من القائمة: \"📞 خدمة العملاء\".\n" +
-              "بعد بدء المحادثة مع خدمة العملاء ستتمكن من إرسال التفاصيل هناك."
-            );
-            if (canShowMenu(from)) { await sendMenuWithPrompt(from); markMenuShown(from); }
+            if (shouldSendWelcome(from)) {
+              const templateMsgId = await sendTemplate(from);
+              if (templateMsgId) {
+                pendingMenuByUser.set(from, templateMsgId);
+              } else {
+                await sendText(
+                  from,
+                  "من فضلك، هنا يتم الاختيار من القائمة فقط.\n" +
+                  "للتواصل المباشر مع ممثلينا اختر من القائمة: \"📞 خدمة العملاء\".\n" +
+                  "بعد بدء المحادثة مع خدمة العملاء ستتمكن من إرسال التفاصيل هناك."
+                );
+                if (canShowMenu(from)) { await sendMenuWithPrompt(from); markMenuShown(from); }
+              }
+            } else {
+              await sendText(
+                from,
+                "من فضلك، هنا يتم الاختيار من القائمة فقط.\n" +
+                "للتواصل المباشر مع ممثلينا اختر من القائمة: \"📞 خدمة العملاء\".\n" +
+                "بعد بدء المحادثة مع خدمة العملاء ستتمكن من إرسال التفاصيل هناك."
+              );
+              if (canShowMenu(from)) { await sendMenuWithPrompt(from); markMenuShown(from); }
+            }
             continue;
           }
         }
