@@ -27,6 +27,7 @@ const AGENT_TEMPLATE_NAME   = (process.env.AGENT_TEMPLATE_NAME || "agent_notify"
 const AGENT_TEMPLATE_LANG   = (process.env.AGENT_TEMPLATE_LANG || "ar").trim();
 
 const BUSINESS_CATALOG_NUMBER = (process.env.BUSINESS_CATALOG_NUMBER || "972557215081").trim();
+const GOLD_PRICE             = (process.env.GOLD_PRICE || "").trim();
 
 if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
   console.error("❌ Missing WHATS_TOKEN or PHONE_NUMBER_ID env vars.");
@@ -133,6 +134,7 @@ async function sendMenu(to) {
           rows: [
             { id: "open_catalog",   title: "عرض الكتالوج",   description: "استعراض جميع المنتجات" },
             { id: "browse_catalog", title: "تصفح حسب الفئة", description: "اختيار مجموعة/فئة" },
+            { id: "gold_price",     title: "💰 سعر الذهب اليوم", description: "عرض السعر الحالي" },
             { id: "show_location",  title: "📍 الموقع",       description: "اللوكيشن وساعات العمل" },
             { id: "talk_agent",     title: "📞 خدمة العملاء",  description: "التواصل مع ممثلنا" }
           ],
@@ -292,6 +294,15 @@ async function handleChoice(from, idOrTitle) {
   } else if (key === "browse_catalog") {
     await sendCatalogLink(from); // extend later to deep-link set
     await sendText(from, "⚠️ ملاحظة مهمة: هذا الكتالوج ليس النهائي وهو قيد التطوير والتحديث المستمر. شكراً لتفهمكم! 🚧");
+  } else if (key === "gold_price" || key === "💰 سعر الذهب اليوم") {
+    if (GOLD_PRICE) {
+      await sendText(
+        from,
+        `💰 سعر الذهب اليوم: ${GOLD_PRICE} شيكل للغرام.\n(يشمل المصنعية، لكن ليس لجميع المنتجات)`
+      );
+    } else {
+      await sendText(from, "سعر الذهب غير متوفر حاليًا. سيتم تحديثه قريبًا.");
+    }
   } else if (key === "show_location" || key === "الموقع") {
     await sendLocation(from);
   } else if (key === "talk_agent" || key === "📞 خدمة العملاء") {
