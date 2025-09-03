@@ -269,6 +269,13 @@ async function handleCustomerMessage(waId, text) {
       service: st.service,
       message: cleanMessage,
     });
+    // Send a direct reply link to the agent with a prefilled opening message
+    const opening = `مرحبًا ${st.name || ""} 🌸 معك من *مجوهرات يارا*، شكرًا لتواصلك معنا 💎 بالنسبة لسؤالك الذي توجهت به:`;
+    const deepLink = `https://wa.me/${waId}?text=${encodeURIComponent(opening)}`;
+    await sendText(
+      AGENT_E164,
+      `يمكنك الرد على ${st.name || "الزبون"} من هذا الرابط ${deepLink}`
+    );
   } catch (e) {
     console.error("❌ Agent template send failed:", e?.response?.data || e);
   }
