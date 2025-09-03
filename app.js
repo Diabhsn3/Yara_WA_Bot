@@ -36,6 +36,20 @@ if (!WHATS_TOKEN || !PHONE_NUMBER_ID) {
 // ===== Utils & guards =====
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Simple URL shortener (TinyURL). Falls back to original URL on failure
+async function shortenUrl(longUrl) {
+  try {
+    const { data } = await axios.get(
+      `https://tinyurl.com/api-create.php?url=${encodeURIComponent(longUrl)}`,
+      { timeout: 10000 }
+    );
+    if (typeof data === "string" && data.startsWith("http")) return data.trim();
+  } catch (e) {
+    // ignore and fallback
+  }
+  return longUrl;
+}
+
 // Dedup inbound messages to avoid retries double-processing
 const processed = new Set();
 function alreadyProcessed(id) {
@@ -270,11 +284,16 @@ async function handleCustomerMessage(waId, text) {
       message: cleanMessage,
     });
     // Send a direct reply link to the agent with a prefilled opening message
-    const opening = `مرحبًا ${st.name || ""} 🌸 معك من *مجوهرات يارا*، شكرًا لتواصلك معنا 💎 بالنسبة لسؤالك الذي توجهت به:`;
-    const deepLink = `https://wa.me/${waId}?text=${encodeURIComponent(opening)}`;
+    const opening = [
+      `مرحبًا ${st.name || ""} 🌸`,
+      `معك من *مجوهرات يارا*، شكرًا لتواصلك معنا 💎`,
+      `بالنسبة لسؤالك الذي توجهت به:`
+    ].join("\n");
+    const deepLong = `https://wa.me/${waId}?text=${encodeURIComponent(opening)}`;
+    const shortLink = await shortenUrl(deepLong);
     await sendText(
       AGENT_E164,
-      `يمكنك الرد على ${st.name || "الزبون"} من هذا الرابط ${deepLink}`
+      `يمكنك الرد على ${st.name || "الزبون"} من هذا الرابط ${shortLink}`
     );
   } catch (e) {
     console.error("❌ Agent template send failed:", e?.response?.data || e);
