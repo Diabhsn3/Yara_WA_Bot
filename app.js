@@ -298,7 +298,7 @@ async function handleChoice(from, idOrTitle) {
     if (GOLD_PRICE) {
       await sendText(
         from,
-        `💰 سعر الذهب اليوم: ${GOLD_PRICE} شيكل للغرام.\n(يشمل المصنعية، لكن ليس لجميع المنتجات)`
+        `💰 سعر الذهب اليوم يبدأ من: *${GOLD_PRICE}* شيكل للغرام\n(يشمل المصنعية)`
       );
     } else {
       await sendText(from, "سعر الذهب غير متوفر حاليًا. سيتم تحديثه قريبًا.");
