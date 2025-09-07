@@ -25,6 +25,8 @@ const TEMPLATE_HEADER_MEDIA_ID  = (process.env.TEMPLATE_HEADER_MEDIA_ID  || "").
 const AGENT_E164            = (process.env.AGENT_E164 || "972525555251").trim();
 const AGENT_TEMPLATE_NAME   = (process.env.AGENT_TEMPLATE_NAME || "agent_notify").trim();
 const AGENT_TEMPLATE_LANG   = (process.env.AGENT_TEMPLATE_LANG || "ar").trim();
+const AGENT_LINK_TEMPLATE_NAME = (process.env.AGENT_LINK_TEMPLATE_NAME || "").trim();
+const AGENT_LINK_TEMPLATE_LANG = (process.env.AGENT_LINK_TEMPLATE_LANG || AGENT_TEMPLATE_LANG).trim();
 
 const BUSINESS_CATALOG_NUMBER = (process.env.BUSINESS_CATALOG_NUMBER || "972557215081").trim();
 const GOLD_PRICE             = (process.env.GOLD_PRICE || "").trim();
@@ -107,6 +109,23 @@ async function waPost(payload) {
     },
     timeout: 20000,
   });
+}
+
+async function sendAgentLinkTemplate(toAgentE164, { customerName, link }) {
+  if (!AGENT_LINK_TEMPLATE_NAME) throw new Error("AGENT_LINK_TEMPLATE_NAME not configured");
+  const template = {
+    name: AGENT_LINK_TEMPLATE_NAME,
+    language: { code: AGENT_LINK_TEMPLATE_LANG },
+    components: [{
+      type: "body",
+      parameters: [
+        { type: "text", text: customerName || "الزبون" },
+        { type: "text", text: link || "-" },
+      ],
+    }],
+  };
+  const { data } = await waPost({ messaging_product:"whatsapp", to: toAgentE164, type:"template", template });
+  return data?.messages?.[0]?.id;
 }
 
 // ===== Senders =====
@@ -291,10 +310,19 @@ async function handleCustomerMessage(waId, text) {
     ].join("\n");
     const deepLong = `https://wa.me/${waId}?text=${encodeURIComponent(opening)}`;
     const shortLink = await shortenUrl(deepLong);
-    await sendText(
-      AGENT_E164,
-      `يمكنك الرد على ${st.name || "الزبون"} من هذا الرابط ${shortLink}`
-    );
+    // Prefer template (allowed outside 24h window); fallback to text when allowed
+    try {
+      if (AGENT_LINK_TEMPLATE_NAME) {
+        await sendAgentLinkTemplate(AGENT_E164, { customerName: st.name, link: shortLink });
+      } else {
+        await sendText(AGENT_E164, `يمكنك الرد على ${st.name || "الزبون"} من هذا الرابط ${shortLink}`);
+      }
+    } catch (e) {
+      // Fallback to plain text if template not configured or fails (and policy allows)
+      try {
+        await sendText(AGENT_E164, `يمكنك الرد على ${st.name || "الزبون"} من هذا الرابط ${shortLink}`);
+      } catch (_) {}
+    }
   } catch (e) {
     console.error("❌ Agent template send failed:", e?.response?.data || e);
   }
